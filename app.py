@@ -58,6 +58,11 @@ CAFE24_REDIRECT_URI = os.getenv("CAFE24_REDIRECT_URI", "")
 CAFE24_OAUTH_SCOPE = os.getenv("CAFE24_OAUTH_SCOPE", "mall.read_product,mall.write_product")
 # 재인증 URL을 직접 고정하고 싶을 때 사용 (선택, 미설정 시 위 정보로 자동 생성)
 CAFE24_REAUTH_URL = os.getenv("CAFE24_REAUTH_URL", "")
+# 카페24 Admin API GET /admin/products에는 "model_name" 파라미터가 없다. 몰 운영자가
+# "모델명"을 실제로 어느 필드에 저장하는지는 몰마다 달라서(자체상품코드에 스타일코드를
+# 넣는 경우가 흔함) 이 필드명으로 검색하도록 매핑한다. 실제 저장 위치가 다르면 .env에서
+# 이 값을 product_name / custom_product_code 등으로 바꿔줄 것.
+CAFE24_MODEL_NAME_FIELD = os.getenv("CAFE24_MODEL_NAME_FIELD", "custom_product_code")
 
 FTP_HOST = os.getenv("FTP_HOST", f"{CAFE24_MALL_ID}.cafe24.com")
 FTP_USER = os.getenv("FTP_USER", "your_ftp_id")
@@ -360,7 +365,7 @@ def cafe24_auth_callback():
 # [상품 검색 API] 카페24 Admin API로 상품 목록 조회
 @app.route('/api/products/search', methods=['GET'])
 def search_products():
-    # model_name은 카페24 API 자체 파라미터가 아니라 UI상의 별칭이며, 아래에서 product_name으로 매핑된다
+    # model_name은 카페24 API 자체 파라미터가 아니라 UI상의 별칭이며, 아래에서 CAFE24_MODEL_NAME_FIELD로 매핑된다
     search_type = request.args.get('search_type', 'product_name')  # model_name | product_name | product_code
     keyword = request.args.get('keyword', '').strip()
     limit = min(int(request.args.get('limit', 20)), 100)
@@ -374,15 +379,17 @@ def search_products():
     elif search_type == 'model_name':
         # 카페24 Admin API GET /admin/products에는 "model_name" 파라미터가 존재하지 않는다
         # (공식 문서상 product_name / product_code / custom_product_code 등만 지원).
-        # 잘못된 파라미터를 그대로 보내면 400 Bad Request가 발생하므로, 가장 가까운
-        # 대체 필드인 product_name으로 검색한다. (모델명이 상품명에 포함되는 몰 운영 관행 기준)
-        logger.warning(f"'model_name' 검색은 카페24 API에 없는 파라미터입니다. product_name으로 대체 검색합니다. (keyword={keyword})")
-        params['product_name'] = keyword
+        # CAFE24_MODEL_NAME_FIELD(기본값 custom_product_code, 자체상품코드)로 검색한다.
+        # 이 몰이 모델명을 다른 필드에 저장한다면 .env의 CAFE24_MODEL_NAME_FIELD를 바꿀 것.
+        params[CAFE24_MODEL_NAME_FIELD] = keyword
     else:
         params['product_name'] = keyword
 
+    logger.info(f"카페24 상품 검색 요청: search_type={search_type} -> params={params}")
+
     try:
         res = cafe24_api_request('GET', f"{CAFE24_API_BASE}/products", params=params, timeout=15)
+        logger.info(f"카페24 상품 검색 실제 요청 URL: {res.url} (status={res.status_code})")
 
         if res.status_code >= 400:
             try:
@@ -400,7 +407,8 @@ def search_products():
             return jsonify({
                 "success": False,
                 "error": f"카페24 상품 조회 실패 ({res.status_code}): {detail_msg}",
-                "status_code": res.status_code
+                "status_code": res.status_code,
+                "requested_url": res.url
             }), 502
 
         raw_products = res.json().get('products', [])
@@ -432,7 +440,7 @@ def search_products():
                 "add_images": add_images
             })
 
-        return jsonify({"success": True, "data": products})
+        return jsonify({"success": True, "data": products, "requested_url": res.url})
 
     except Cafe24ReauthRequired as e:
         logger.error(f"카페24 재인증 필요: {e}")

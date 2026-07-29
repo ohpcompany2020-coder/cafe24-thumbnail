@@ -1,6 +1,8 @@
 import os
 import io
+import base64
 import logging
+import threading
 import ftplib
 import requests
 from dotenv import load_dotenv
@@ -28,8 +30,14 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 CAFE24_MALL_ID = os.getenv("CAFE24_MALL_ID", "your_mall_id")
 CAFE24_ACCESS_TOKEN = os.getenv("CAFE24_ACCESS_TOKEN", "your_access_token")
+CAFE24_REFRESH_TOKEN = os.getenv("CAFE24_REFRESH_TOKEN", "")
+CAFE24_CLIENT_ID = os.getenv("CAFE24_CLIENT_ID", "")
+CAFE24_CLIENT_SECRET = os.getenv("CAFE24_CLIENT_SECRET", "")
 CAFE24_API_VERSION = os.getenv("CAFE24_API_VERSION", "2024-03-01")
 CAFE24_API_BASE = f"https://{CAFE24_MALL_ID}.cafe24api.com/api/v2/admin"
+CAFE24_TOKEN_URL = f"https://{CAFE24_MALL_ID}.cafe24api.com/api/v2/oauth/token"
+# 리프레시 토큰도 만료되었을 때 운영자에게 안내할 재인증 URL (선택, 미설정 시 URL 없이 메시지만 반환)
+CAFE24_REAUTH_URL = os.getenv("CAFE24_REAUTH_URL", "")
 
 FTP_HOST = os.getenv("FTP_HOST", f"{CAFE24_MALL_ID}.cafe24.com")
 FTP_USER = os.getenv("FTP_USER", "your_ftp_id")
@@ -40,13 +48,78 @@ FTP_BASE_URL = f"http://{CAFE24_MALL_ID}.cafe24.com/web/upload/thumbnail/"
 if "your_" in CAFE24_MALL_ID or "your_" in CAFE24_ACCESS_TOKEN:
     logger.warning("CAFE24_MALL_ID / CAFE24_ACCESS_TOKEN이 기본값입니다. .env에 실제 운영 값을 설정해 주세요.")
 
+# Access/Refresh Token은 갱신될 수 있으므로 프로세스 메모리에 별도로 보관 (재시작 시 .env 값으로 초기화됨)
+_cafe24_token = {
+    "access_token": CAFE24_ACCESS_TOKEN,
+    "refresh_token": CAFE24_REFRESH_TOKEN,
+}
+_cafe24_token_lock = threading.Lock()
+
+
+class Cafe24ReauthRequired(Exception):
+    """Refresh Token까지 만료/무효화되어 카페24 앱 재인증이 필요할 때 발생"""
+    pass
+
 
 def cafe24_headers():
     return {
-        "Authorization": f"Bearer {CAFE24_ACCESS_TOKEN}",
+        "Authorization": f"Bearer {_cafe24_token['access_token']}",
         "Content-Type": "application/json",
         "X-Cafe24-Api-Version": CAFE24_API_VERSION
     }
+
+
+def refresh_cafe24_access_token():
+    """CAFE24_REFRESH_TOKEN으로 Access Token을 재발급받아 메모리/환경변수에 반영한다."""
+    with _cafe24_token_lock:
+        refresh_token = _cafe24_token.get("refresh_token")
+        if not refresh_token or not CAFE24_CLIENT_ID or not CAFE24_CLIENT_SECRET:
+            raise Cafe24ReauthRequired("Refresh Token 또는 Client 인증정보가 설정되어 있지 않습니다.")
+
+        basic_credential = base64.b64encode(f"{CAFE24_CLIENT_ID}:{CAFE24_CLIENT_SECRET}".encode()).decode()
+        try:
+            res = requests.post(
+                CAFE24_TOKEN_URL,
+                headers={
+                    "Authorization": f"Basic {basic_credential}",
+                    "Content-Type": "application/x-www-form-urlencoded"
+                },
+                data={"grant_type": "refresh_token", "refresh_token": refresh_token},
+                timeout=15
+            )
+        except Exception as e:
+            logger.exception("카페24 Access Token 갱신 요청 실패")
+            raise Cafe24ReauthRequired(f"토큰 갱신 요청 중 오류가 발생했습니다: {str(e)}")
+
+        if res.status_code != 200:
+            logger.error(f"카페24 Access Token 갱신 실패 ({res.status_code}): {res.text}")
+            raise Cafe24ReauthRequired("Refresh Token이 만료되었거나 갱신에 실패했습니다.")
+
+        payload = res.json()
+        new_access_token = payload.get("access_token")
+        new_refresh_token = payload.get("refresh_token", refresh_token)
+        if not new_access_token:
+            raise Cafe24ReauthRequired("토큰 갱신 응답에 access_token이 없습니다.")
+
+        _cafe24_token["access_token"] = new_access_token
+        _cafe24_token["refresh_token"] = new_refresh_token
+        # 프로세스 재시작 전까지는 os.environ도 함께 갱신해 다른 코드에서 참조하더라도 최신값을 보게 함
+        os.environ["CAFE24_ACCESS_TOKEN"] = new_access_token
+        os.environ["CAFE24_REFRESH_TOKEN"] = new_refresh_token
+        logger.info("카페24 Access Token 갱신 완료")
+        return new_access_token
+
+
+def cafe24_api_request(method, url, **kwargs):
+    """카페24 Admin API 호출 공용 래퍼. 401 응답 시 Access Token을 한 번 갱신 후 재시도한다."""
+    res = requests.request(method, url, headers=cafe24_headers(), **kwargs)
+
+    if res.status_code == 401:
+        logger.warning(f"카페24 API 401 응답 - Access Token 갱신 후 재시도 ({method} {url})")
+        refresh_cafe24_access_token()  # 실패 시 Cafe24ReauthRequired 발생, 호출부로 전파
+        res = requests.request(method, url, headers=cafe24_headers(), **kwargs)
+
+    return res
 
 # ==========================================
 # 1:1 -> 1:1.4 (1000x1400) 가공 로직
@@ -190,9 +263,17 @@ def search_products():
         params['product_name'] = keyword
 
     try:
-        res = requests.get(f"{CAFE24_API_BASE}/products", headers=cafe24_headers(), params=params, timeout=15)
+        res = cafe24_api_request('GET', f"{CAFE24_API_BASE}/products", params=params, timeout=15)
         res.raise_for_status()
         raw_products = res.json().get('products', [])
+    except Cafe24ReauthRequired as e:
+        logger.error(f"카페24 재인증 필요: {e}")
+        return jsonify({
+            "success": False,
+            "error": "카페24 토큰 재인증이 필요합니다. 관리자 페이지에서 앱을 재인증해 주세요.",
+            "reauth_required": True,
+            **({"reauth_url": CAFE24_REAUTH_URL} if CAFE24_REAUTH_URL else {})
+        }), 401
     except Exception as e:
         logger.exception("카페24 상품 검색 실패")
         return jsonify({"success": False, "error": f"카페24 상품 조회 실패: {str(e)}"}), 502
@@ -273,7 +354,6 @@ def send_to_cafe24():
 
     success_list = []
     fail_list = []
-    headers = cafe24_headers()
 
     for item in items:
         p_no = item.get('product_no')
@@ -313,7 +393,7 @@ def send_to_cafe24():
 
             # 3. 카페24 API 호출
             api_url = f"{CAFE24_API_BASE}/products/{p_no}"
-            res = requests.put(api_url, json={"request": {"images": images_payload}}, headers=headers, timeout=15)
+            res = cafe24_api_request('PUT', api_url, json={"request": {"images": images_payload}}, timeout=15)
 
             if res.status_code == 200:
                 success_list.append({"product_no": p_no, "url": ftp_main_url})
@@ -322,6 +402,17 @@ def send_to_cafe24():
                 logger.error(f"카페24 송신 실패 (product_no={p_no}): {err_msg}")
                 fail_list.append({"product_no": p_no, "reason": err_msg})
 
+        except Cafe24ReauthRequired as e:
+            logger.error(f"카페24 재인증 필요, 송신 중단 (product_no={p_no}): {e}")
+            fail_list.append({"product_no": p_no, "reason": "카페24 토큰 재인증이 필요합니다."})
+            return jsonify({
+                "success": False,
+                "error": "카페24 토큰 재인증이 필요합니다. 관리자 페이지에서 앱을 재인증해 주세요.",
+                "reauth_required": True,
+                **({"reauth_url": CAFE24_REAUTH_URL} if CAFE24_REAUTH_URL else {}),
+                "summary": {"total": len(items), "success_count": len(success_list), "fail_count": len(fail_list)},
+                "failures": fail_list
+            }), 401
         except Exception as e:
             logger.exception(f"카페24 송신 중 예외 발생 (product_no={p_no})")
             fail_list.append({"product_no": p_no, "reason": str(e)})

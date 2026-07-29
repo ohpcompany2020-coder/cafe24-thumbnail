@@ -1,10 +1,12 @@
 import os
 import io
+import html
 import base64
 import logging
 import threading
 import ftplib
 import requests
+from urllib.parse import urlencode
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, render_template, send_from_directory
 from PIL import Image, ImageSequence
@@ -36,7 +38,11 @@ CAFE24_CLIENT_SECRET = os.getenv("CAFE24_CLIENT_SECRET", "")
 CAFE24_API_VERSION = os.getenv("CAFE24_API_VERSION", "2024-03-01")
 CAFE24_API_BASE = f"https://{CAFE24_MALL_ID}.cafe24api.com/api/v2/admin"
 CAFE24_TOKEN_URL = f"https://{CAFE24_MALL_ID}.cafe24api.com/api/v2/oauth/token"
-# 리프레시 토큰도 만료되었을 때 운영자에게 안내할 재인증 URL (선택, 미설정 시 URL 없이 메시지만 반환)
+CAFE24_AUTHORIZE_URL = f"https://{CAFE24_MALL_ID}.cafe24api.com/api/v2/oauth/authorize"
+# OAuth 재인증 시 카페24가 콜백을 보낼 주소 (카페24 개발자센터에 등록된 Redirect URI와 동일해야 함)
+CAFE24_REDIRECT_URI = os.getenv("CAFE24_REDIRECT_URI", "")
+CAFE24_OAUTH_SCOPE = os.getenv("CAFE24_OAUTH_SCOPE", "mall.read_product,mall.write_product")
+# 재인증 URL을 직접 고정하고 싶을 때 사용 (선택, 미설정 시 위 정보로 자동 생성)
 CAFE24_REAUTH_URL = os.getenv("CAFE24_REAUTH_URL", "")
 
 FTP_HOST = os.getenv("FTP_HOST", f"{CAFE24_MALL_ID}.cafe24.com")
@@ -108,6 +114,28 @@ def refresh_cafe24_access_token():
         os.environ["CAFE24_REFRESH_TOKEN"] = new_refresh_token
         logger.info("카페24 Access Token 갱신 완료")
         return new_access_token
+
+
+def build_cafe24_authorize_url(state=None):
+    """CAFE24_CLIENT_ID/CAFE24_REDIRECT_URI로 카페24 OAuth 2.0 인증 페이지 URL을 생성한다.
+    필수 설정이 없으면 None을 반환한다."""
+    if not CAFE24_CLIENT_ID or not CAFE24_REDIRECT_URI:
+        return None
+
+    params = {
+        "response_type": "code",
+        "client_id": CAFE24_CLIENT_ID,
+        "redirect_uri": CAFE24_REDIRECT_URI,
+        "scope": CAFE24_OAUTH_SCOPE,
+    }
+    if state:
+        params["state"] = state
+    return f"{CAFE24_AUTHORIZE_URL}?{urlencode(params)}"
+
+
+def get_cafe24_reauth_url():
+    """운영자에게 안내할 재인증 URL. CAFE24_REAUTH_URL이 설정되어 있으면 그 값을 우선 사용한다."""
+    return CAFE24_REAUTH_URL or build_cafe24_authorize_url()
 
 
 def cafe24_api_request(method, url, **kwargs):
@@ -244,6 +272,77 @@ def index():
 def serve_processed_image(filename):
     return send_from_directory(UPLOAD_FOLDER, filename)
 
+# [재인증 URL 조회 API] 화면 상단 "카페24 어드민 연동/재인증하기" 버튼이 사용
+@app.route('/api/auth/reauth-url', methods=['GET'])
+def get_reauth_url():
+    reauth_url = get_cafe24_reauth_url()
+    if not reauth_url:
+        return jsonify({
+            "success": False,
+            "error": "CAFE24_CLIENT_ID / CAFE24_REDIRECT_URI 설정이 필요합니다."
+        }), 400
+    return jsonify({"success": True, "reauth_url": reauth_url})
+
+# [OAuth 콜백] 카페24 인증 완료 후 Authorization Code를 Access/Refresh Token으로 교환
+@app.route('/api/auth/callback', methods=['GET'])
+def cafe24_auth_callback():
+    error = request.args.get('error')
+    if error:
+        logger.error(f"카페24 인증 거부/실패: {error}")
+        return f"<h2>카페24 인증에 실패했습니다.</h2><p>{html.escape(error)}</p>", 400
+
+    code = request.args.get('code')
+    if not code:
+        return "<h2>Authorization Code가 전달되지 않았습니다.</h2>", 400
+
+    if not (CAFE24_CLIENT_ID and CAFE24_CLIENT_SECRET and CAFE24_REDIRECT_URI):
+        return "<h2>서버에 CAFE24_CLIENT_ID / CAFE24_CLIENT_SECRET / CAFE24_REDIRECT_URI 설정이 필요합니다.</h2>", 500
+
+    basic_credential = base64.b64encode(f"{CAFE24_CLIENT_ID}:{CAFE24_CLIENT_SECRET}".encode()).decode()
+    try:
+        res = requests.post(
+            CAFE24_TOKEN_URL,
+            headers={
+                "Authorization": f"Basic {basic_credential}",
+                "Content-Type": "application/x-www-form-urlencoded"
+            },
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": CAFE24_REDIRECT_URI
+            },
+            timeout=15
+        )
+    except Exception as e:
+        logger.exception("카페24 Authorization Code 토큰 교환 요청 실패")
+        return f"<h2>토큰 발급 요청 중 오류가 발생했습니다.</h2><p>{html.escape(str(e))}</p>", 502
+
+    if res.status_code != 200:
+        logger.error(f"카페24 토큰 발급 실패 ({res.status_code}): {res.text}")
+        return f"<h2>토큰 발급에 실패했습니다.</h2><p>{html.escape(res.text)}</p>", 502
+
+    payload = res.json()
+    access_token = payload.get('access_token')
+    refresh_token = payload.get('refresh_token')
+    if not access_token or not refresh_token:
+        logger.error(f"카페24 토큰 응답에 access_token/refresh_token 누락: {payload}")
+        return "<h2>토큰 응답이 올바르지 않습니다.</h2>", 502
+
+    with _cafe24_token_lock:
+        _cafe24_token["access_token"] = access_token
+        _cafe24_token["refresh_token"] = refresh_token
+        os.environ["CAFE24_ACCESS_TOKEN"] = access_token
+        os.environ["CAFE24_REFRESH_TOKEN"] = refresh_token
+
+    logger.info("카페24 신규 인증 완료 - Access/Refresh Token 저장됨")
+    return """
+        <html><body style="font-family:sans-serif;text-align:center;padding-top:80px;">
+            <h2>✅ 카페24 인증이 완료되었습니다.</h2>
+            <p>이 창은 자동으로 닫힙니다. 닫히지 않으면 <a href="/">여기</a>를 눌러 돌아가 주세요.</p>
+            <script>setTimeout(function() { window.close(); }, 3000);</script>
+        </body></html>
+    """
+
 # [상품 검색 API] 카페24 Admin API로 상품 목록 조회
 @app.route('/api/products/search', methods=['GET'])
 def search_products():
@@ -268,11 +367,12 @@ def search_products():
         raw_products = res.json().get('products', [])
     except Cafe24ReauthRequired as e:
         logger.error(f"카페24 재인증 필요: {e}")
+        reauth_url = get_cafe24_reauth_url()
         return jsonify({
             "success": False,
             "error": "카페24 토큰 재인증이 필요합니다. 관리자 페이지에서 앱을 재인증해 주세요.",
             "reauth_required": True,
-            **({"reauth_url": CAFE24_REAUTH_URL} if CAFE24_REAUTH_URL else {})
+            **({"reauth_url": reauth_url} if reauth_url else {})
         }), 401
     except Exception as e:
         logger.exception("카페24 상품 검색 실패")
@@ -405,11 +505,12 @@ def send_to_cafe24():
         except Cafe24ReauthRequired as e:
             logger.error(f"카페24 재인증 필요, 송신 중단 (product_no={p_no}): {e}")
             fail_list.append({"product_no": p_no, "reason": "카페24 토큰 재인증이 필요합니다."})
+            reauth_url = get_cafe24_reauth_url()
             return jsonify({
                 "success": False,
                 "error": "카페24 토큰 재인증이 필요합니다. 관리자 페이지에서 앱을 재인증해 주세요.",
                 "reauth_required": True,
-                **({"reauth_url": CAFE24_REAUTH_URL} if CAFE24_REAUTH_URL else {}),
+                **({"reauth_url": reauth_url} if reauth_url else {}),
                 "summary": {"total": len(items), "success_count": len(success_list), "fail_count": len(fail_list)},
                 "failures": fail_list
             }), 401

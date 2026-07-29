@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>카페24 썸네일 1000x1400 단계별 변환 및 송신 시스템</title>
+    <!-- Tailwind CSS (디자인용) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, system-ui, Roboto, sans-serif; }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-800 p-6">
+
+    <div class="max-w-7xl mx-auto space-y-6">
+        
+        <!-- 헤더 -->
+        <header class="bg-white p-5 rounded-xl shadow-sm border border-slate-200 flex justify-between items-center">
+            <div>
+                <h1 class="text-xl font-bold text-slate-900">🖼️ 카페24 썸네일 일괄 변환 및 검수/송신 시스템</h1>
+                <p class="text-sm text-slate-500 mt-1">1000x1000px 썸네일을 1000x1400px로 미리 변환하여 검수 후 카페24로 전송합니다.</p>
+            </div>
+            <div class="text-xs font-mono bg-indigo-50 text-indigo-600 px-3 py-1.5 rounded-full border border-indigo-100">
+                Target: 1000x1400 px (JPG/PNG/GIF)
+            </div>
+        </header>
+
+        <!-- 1. 상품 검색 영역 -->
+        <section class="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
+            <h2 class="text-sm font-semibold text-slate-500 uppercase tracking-wider mb-3">1. 상품 검색</h2>
+            <div class="flex gap-3">
+                <select id="searchType" class="px-4 py-2.5 border border-slate-300 rounded-lg bg-slate-50 text-sm font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                    <option value="model_name">모델명 검색</option>
+                    <option value="product_name">상품명 검색</option>
+                    <option value="product_code">상품코드 검색</option>
+                </select>
+                <input type="text" id="searchInput" placeholder="검색어를 입력하세요 (예: JK-2026)" class="flex-1 px-4 py-2.5 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                <button id="searchBtn" onclick="searchProducts()" class="px-6 py-2.5 bg-slate-900 hover:bg-slate-800 text-white font-medium text-sm rounded-lg transition-colors flex items-center gap-2">
+                    🔍 상품 읽어오기
+                </button>
+            </div>
+        </section>
+
+        <!-- 2. 컨트롤 영역 (1단계: 변환실행 / 2단계: 카페24로 송신) -->
+        <section class="bg-white p-4 rounded-xl shadow-sm border border-slate-200 space-y-4">
+            <div class="flex flex-wrap justify-between items-center gap-4">
+                <div class="flex items-center gap-4">
+                    <label class="flex items-center gap-2 text-sm font-medium cursor-pointer">
+                        <input type="checkbox" id="selectAll" onchange="toggleSelectAll()" class="w-4 h-4 text-indigo-600 rounded focus:ring-indigo-500">
+                        전체 선택
+                    </label>
+                    <div class="h-4 w-px bg-slate-200"></div>
+                    <div class="flex items-center gap-2">
+                        <span class="text-sm font-medium text-slate-600">가공 모드:</span>
+                        <select id="processMode" class="px-3 py-1.5 border border-slate-300 rounded-lg text-sm font-semibold bg-indigo-50 text-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                            <option value="product">제품컷 (상하 여백 채우기)</option>
+                            <option value="model">모델컷 (확대 및 가로 크롭)</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="flex items-center gap-3">
+                    <select id="pageSize" class="px-3 py-1.5 border border-slate-300 rounded-lg text-sm text-slate-600 focus:outline-none">
+                        <option value="20">20개씩 보기</option>
+                        <option value="50">50개씩 보기</option>
+                        <option value="100">100개씩 보기</option>
+                    </select>
+
+                    <!-- [1단계] 변환실행 버튼 -->
+                    <button id="convertBtn" onclick="runConvert()" class="px-5 py-2.5 bg-slate-800 hover:bg-slate-900 text-white font-bold text-sm rounded-lg transition-all shadow-sm flex items-center gap-2">
+                        <span>🎨</span> <span>1단계: 변환실행</span>
+                    </button>
+
+                    <!-- [2단계] 카페24 송신 버튼 -->
+                    <button id="sendBtn" onclick="runSendToCafe24()" class="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-sm rounded-lg transition-all shadow-sm flex items-center gap-2">
+                        <span>🚀</span> <span>2단계: 카페24로 송신</span>
+                    </button>
+                </div>
+            </div>
+
+            <!-- 진행 상태 및 진행률 바 (Progress Bar) -->
+            <div id="progressArea" class="hidden pt-3 border-t border-slate-100 space-y-2">
+                <div class="flex justify-between items-center text-xs font-semibold">
+                    <span id="stepStatus" class="text-indigo-600">작업 진행 중...</span>
+                    <span id="progressPercent" class="text-slate-500">0 / 0 (0%)</span>
+                </div>
+                <div class="w-full bg-slate-100 rounded-full h-2.5 overflow-hidden">
+                    <div id="progressBar" class="bg-indigo-600 h-2.5 rounded-full transition-all duration-300" style="width: 0%"></div>
+                </div>
+            </div>
+        </section>
+
+        <!-- 3. 상품 목록 표 (변환 전 vs 변환 후 이미지 리스트 표시) -->
+        <section class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+            <table class="w-full text-left text-sm text-slate-600">
+                <thead class="bg-slate-100 text-slate-700 font-semibold border-b border-slate-200">
+                    <tr>
+                        <th class="p-4 w-12 text-center">선택</th>
+                        <th class="p-4 w-16 text-center">No.</th>
+                        <th class="p-4 w-28 text-center">원본 (1:1)</th>
+                        <th class="p-4 w-28 text-center bg-indigo-50/50 text-indigo-900">변환 후 (1:1.4)</th>
+                        <th class="p-4">상품명 / 상품코드</th>
+                        <th class="p-4 w-24 text-center">포맷</th>
+                        <th class="p-4 w-32 text-center">진행 단계</th>
+                    </tr>
+                </thead>
+                <tbody id="productTableBody" class="divide-y divide-slate-100">
+                    <!-- 샘플 데이터 행 -->
+                    <tr class="hover:bg-slate-50">
+                        <td class="p-4 text-center"><input type="checkbox" class="product-check w-4 h-4 rounded"></td>
+                        <td class="p-4 text-center font-mono text-xs text-slate-400">1</td>
+                        <!-- 원본 1:1 이미지 -->
+                        <td class="p-4 text-center">
+                            <div class="w-16 h-16 bg-slate-100 rounded border border-slate-200 mx-auto flex items-center justify-center text-[10px] text-slate-400 font-mono">
+                                1000x1000
+                            </div>
+                        </td>
+                        <!-- 변환 실행 시 이 칸에 가공된 1:1.4 미리보기 이미지가 나타납니다 -->
+                        <td class="p-4 text-center bg-indigo-50/30">
+                            <div class="w-16 h-[22.4px] bg-indigo-100/50 border border-indigo-200 rounded mx-auto flex items-center justify-center text-[10px] text-indigo-400 font-mono">
+                                미변환
+                            </div>
+                        </td>
+                        <td class="p-4">
+                            <div class="font-semibold text-slate-800">상단 검색창에서 모델명을 입력 후 조회해 주세요</div>
+                            <div class="text-xs text-slate-400 mt-0.5">P00000XX</div>
+                        </td>
+                        <td class="p-4 text-center"><span class="px-2 py-1 bg-slate-100 text-slate-600 rounded text-xs font-mono">JPG/GIF</span></td>
+                        <td class="p-4 text-center"><span class="px-2 py-1 bg-slate-100 text-slate-500 rounded text-xs font-medium">조회 완료</span></td>
+                    </tr>
+                </tbody>
+            </table>
+        </section>
+
+        <!-- 4. 실패 상품 리스트 (실패 시에만 노출) -->
+        <section id="failureArea" class="hidden bg-red-50 p-5 rounded-xl border border-red-200 space-y-3">
+            <div class="flex justify-between items-center">
+                <h3 class="text-sm font-bold text-red-700 flex items-center gap-2">
+                    ⚠️ 카페24 송신 실패 상품 목록 (<span id="failCount">0</span>건)
+                </h3>
+                <button onclick="retryFailed()" class="px-4 py-1.5 bg-red-600 hover:bg-red-700 text-white text-xs font-bold rounded-lg transition-colors">
+                    🔄 실패 상품만 재송신
+                </button>
+            </div>
+            <div class="bg-white rounded-lg border border-red-100 overflow-hidden">
+                <table class="w-full text-left text-xs">
+                    <thead class="bg-red-100/50 text-red-800 font-semibold">
+                        <tr>
+                            <th class="p-3 w-10 text-center"><input type="checkbox" checked></th>
+                            <th class="p-3 w-28">상품코드</th>
+                            <th class="p-3">상품명</th>
+                            <th class="p-3">실패 사유</th>
+                        </tr>
+                    </thead>
+                    <tbody id="failTableBody" class="divide-y divide-red-50 text-slate-700">
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+    </div>
+
+    <script>
+        function toggleSelectAll() {
+            const isChecked = document.getElementById('selectAll').checked;
+            document.querySelectorAll('.product-check').forEach(cb => cb.checked = isChecked);
+        }
+        function searchProducts() { alert('백엔드 연동 후 상품이 읽어와집니다.'); }
+        
+        // 1단계 변환실행 시뮬레이션
+        function runConvert() {
+            document.getElementById('progressArea').classList.remove('hidden');
+            document.getElementById('stepStatus').innerText = "1단계: 썸네일 이미지 변환 및 리스트 업데이트 중...";
+            alert('이미지 변환이 완료되어 상품리스트에 보여집니다. 가공 상태를 확인 후 [2단계: 카페24로 송신]을 클릭하세요.');
+        }
+
+        // 2단계 송신 시뮬레이션
+        function runSendToCafe24() {
+            document.getElementById('progressArea').classList.remove('hidden');
+            document.getElementById('stepStatus').innerText = "2단계: 카페24 API로 대표 썸네일 전송 및 추가이미지 삭제 중...";
+            alert('카페24 송신이 완료되었습니다.');
+        }
+
+        function retryFailed() { alert('실패 상품 재송신을 시작합니다.'); }
+    </script>
+</body>
+</html>

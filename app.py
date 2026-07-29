@@ -5,7 +5,14 @@ import requests
 from flask import Flask, request, jsonify, render_template, send_from_directory
 from PIL import Image, ImageSequence
 
-app = Flask(__name__, static_folder='static', template_folder='.')
+
+import os
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+template_dir = os.path.join(BASE_DIR, 'templates')
+
+app = Flask(__name__, template_folder=template_dir)
+
 
 # ==========================================
 # 환경 설정 (.env 환경변수 활용 권장)

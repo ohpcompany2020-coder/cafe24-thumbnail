@@ -32,40 +32,53 @@ FTP_BASE_URL = f"http://{CAFE24_MALL_ID}.cafe24.com/web/upload/thumbnail/"
 # ==========================================
 # 1:1 -> 1:1.4 (1000x1400) 가공 로직
 # ==========================================
-def pad_to_1400_ratio(img, target_w=1000, target_h=1400):
-    """[product 모드] 1:1 이미지를 1000x1400 Canvas 중앙에 배치 (상하 여백 흰색 채움)"""
+def pad_to_1400_ratio(img, target_w=1000, target_h=1400, bg_color=(255, 255, 255)):
+    """[제품컷 모드] 정방향(1:1) 이미지를 비율 유지하며 가로 1000px로 맞추고 상하에 흰색 여백을 채워 1000x1400 생성"""
     img = img.convert('RGBA')
     orig_w, orig_h = img.size
+    
+    # 가로(1000px)에 맞추어 비율 유지 축소/확대 (1:1 이미지의 경우 1000x1000이 됨)
+    scale = target_w / orig_w
+    new_w = target_w
+    new_h = int(orig_h * scale)
+    
+    # 만약 세로가 1400보다 크면 세로에 맞춤
+    if new_h > target_h:
+        scale = target_h / orig_h
+        new_h = target_h
+        new_w = int(orig_w * scale)
+        
+    resized_img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    
+    # 1000x1400 흰색 바탕 도화지 만들기
+    background = Image.new('RGBA', (target_w, target_h), bg_color + (255,))
+    
+    # 중앙에 이미지 배치 (상하 여백 채우기)
+    paste_x = (target_w - new_w) // 2
+    paste_y = (target_h - new_h) // 2
+    background.paste(resized_img, (paste_x, paste_y), resized_img)
+    
+    return background.convert('RGB')
 
-    # Canvas 생성 (흰색 배경)
-    canvas = Image.new('RGBA', (target_w, target_h), (255, 255, 255, 255))
-
-    # 가로 1000 맞춤 리사이즈
-    if orig_w != target_w:
-        new_h = int(orig_h * (target_w / orig_w))
-        img = img.resize((target_w, new_h), Image.Resampling.LANCZOS)
-
-    # 상하 중앙 배치
-    offset_y = (target_h - img.height) // 2
-    canvas.paste(img, (0, offset_y), mask=img if img.mode == 'RGBA' else None)
-    return canvas.convert('RGB')
 
 def crop_to_1400_ratio(img, target_w=1000, target_h=1400):
-    """[model 모드] 1000x1400 비율을 꽉 채우도록 확대(비율 유지) 후 중앙 기준 가로 크롭"""
+    """[모델컷 모드] 1000x1400 세로 비율(1:1.4)을 꽉 채우도록 확대 후 여백 없이 중앙 기준 절삭"""
     img = img.convert('RGBA')
     orig_w, orig_h = img.size
-
-    # 타겟 박스를 여백 없이 덮을 때까지 확대 (cover 방식)
+    
+    # 1000x1400 비율(cover)을 만족하도록 확대 비율 계산
     scale = max(target_w / orig_w, target_h / orig_h)
-    new_w = max(target_w, round(orig_w * scale))
-    new_h = max(target_h, round(orig_h * scale))
-    img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-
-    # 중앙 기준으로 목표 사이즈만큼 절삭 (가로가 남는 경우 좌우를, 세로가 남는 경우 상하를 절삭)
+    new_w = int(orig_w * scale)
+    new_h = int(orig_h * scale)
+    
+    resized_img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    
+    # 중앙 기준으로 target_w x target_h 만큼 절삭(Crop)
     left = (new_w - target_w) // 2
     top = (new_h - target_h) // 2
-    img = img.crop((left, top, left + target_w, top + target_h))
-    return img.convert('RGB')
+    cropped = resized_img.crop((left, top, left + target_w, top + target_h))
+    
+    return cropped.convert('RGB')
 
 def process_image_bytes(image_bytes, filename, mode='product'):
     """GIF Multi-frame / JPG / PNG 처리

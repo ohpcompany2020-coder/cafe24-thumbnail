@@ -39,7 +39,7 @@
                     <option value="product_name">상품명 검색</option>
                     <option value="product_code">상품코드 검색</option>
                 </select>
-                <input type="text" id="searchInput" placeholder="검색어를 입력하세요 (예: JK-2026)" class="flex-1 px-4 py-2.5 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                <input type="text" id="searchInput" placeholder="검색어를 입력하세요 (예: JK-2026)" onkeydown="handleSearchInputKeydown(event)" class="flex-1 px-4 py-2.5 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500">
                 <button id="searchBtn" onclick="searchProducts()" class="px-6 py-2.5 bg-slate-900 hover:bg-slate-800 text-white font-medium text-sm rounded-lg transition-colors flex items-center gap-2">
                     🔍 상품 읽어오기
                 </button>
@@ -69,6 +69,11 @@
                         <option value="20">20개씩 보기</option>
                         <option value="50">50개씩 보기</option>
                         <option value="100">100개씩 보기</option>
+                    </select>
+
+                    <select id="sortOrder" onchange="searchProducts()" class="px-3 py-1.5 border border-slate-300 rounded-lg text-sm text-slate-600 focus:outline-none">
+                        <option value="asc">등록순</option>
+                        <option value="desc" selected>등록역순</option>
                     </select>
 
                     <!-- [1단계] 변환실행 버튼 -->
@@ -182,11 +187,20 @@
             }
         }
 
+        // 검색어 입력창에서 Enter 입력 시 버튼 클릭과 동일하게 검색 실행
+        function handleSearchInputKeydown(event) {
+            if (event.key === 'Enter' || event.keyCode === 13) {
+                event.preventDefault();
+                searchProducts();
+            }
+        }
+
         // GET /api/products/search 호출 - 카페24 Admin API 기반 상품 검색
         async function searchProducts() {
             const searchType = document.getElementById('searchType').value;
             const keyword = document.getElementById('searchInput').value.trim();
             const limit = document.getElementById('pageSize').value;
+            const order = document.getElementById('sortOrder').value; // asc(등록순) | desc(등록역순)
 
             if (!keyword) {
                 alert('검색어를 입력해 주세요.');
@@ -198,7 +212,7 @@
             searchBtn.classList.add('opacity-50', 'cursor-not-allowed');
 
             try {
-                const params = new URLSearchParams({ search_type: searchType, keyword, limit });
+                const params = new URLSearchParams({ search_type: searchType, keyword, limit, sort: 'created_date', order });
                 const res = await fetch(`/api/products/search?${params.toString()}`);
                 const json = await res.json();
 

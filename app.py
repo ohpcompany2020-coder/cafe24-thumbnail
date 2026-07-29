@@ -1,33 +1,52 @@
 import os
 import io
+import logging
 import ftplib
 import requests
+from dotenv import load_dotenv
 from flask import Flask, request, jsonify, render_template, send_from_directory
 from PIL import Image, ImageSequence
 
-
-import os
+load_dotenv()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 template_dir = os.path.join(BASE_DIR, 'templates')
 
 app = Flask(__name__, template_folder=template_dir)
 
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 # ==========================================
-# 환경 설정 (.env 환경변수 활용 권장)
+# 환경 설정 (.env 환경변수 활용)
 # ==========================================
 UPLOAD_FOLDER = os.path.join(app.root_path, 'static', 'processed_images')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 CAFE24_MALL_ID = os.getenv("CAFE24_MALL_ID", "your_mall_id")
 CAFE24_ACCESS_TOKEN = os.getenv("CAFE24_ACCESS_TOKEN", "your_access_token")
+CAFE24_API_VERSION = os.getenv("CAFE24_API_VERSION", "2024-03-01")
+CAFE24_API_BASE = f"https://{CAFE24_MALL_ID}.cafe24api.com/api/v2/admin"
 
 FTP_HOST = os.getenv("FTP_HOST", f"{CAFE24_MALL_ID}.cafe24.com")
 FTP_USER = os.getenv("FTP_USER", "your_ftp_id")
 FTP_PASS = os.getenv("FTP_PASS", "your_ftp_password")
 FTP_PORT = int(os.getenv("FTP_PORT", 21))
 FTP_BASE_URL = f"http://{CAFE24_MALL_ID}.cafe24.com/web/upload/thumbnail/"
+
+if "your_" in CAFE24_MALL_ID or "your_" in CAFE24_ACCESS_TOKEN:
+    logger.warning("CAFE24_MALL_ID / CAFE24_ACCESS_TOKEN이 기본값입니다. .env에 실제 운영 값을 설정해 주세요.")
+
+
+def cafe24_headers():
+    return {
+        "Authorization": f"Bearer {CAFE24_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+        "X-Cafe24-Api-Version": CAFE24_API_VERSION
+    }
 
 # ==========================================
 # 1:1 -> 1:1.4 (1000x1400) 가공 로직
@@ -152,6 +171,54 @@ def index():
 def serve_processed_image(filename):
     return send_from_directory(UPLOAD_FOLDER, filename)
 
+# [상품 검색 API] 카페24 Admin API로 상품 목록 조회
+@app.route('/api/products/search', methods=['GET'])
+def search_products():
+    search_type = request.args.get('search_type', 'product_name')  # model_name | product_name | product_code
+    keyword = request.args.get('keyword', '').strip()
+    limit = min(int(request.args.get('limit', 20)), 100)
+
+    if not keyword:
+        return jsonify({"success": False, "error": "검색어를 입력해 주세요."}), 400
+
+    params = {"limit": limit}
+    if search_type == 'model_name':
+        params['model_name'] = keyword
+    elif search_type == 'product_code':
+        params['product_code'] = keyword
+    else:
+        params['product_name'] = keyword
+
+    try:
+        res = requests.get(f"{CAFE24_API_BASE}/products", headers=cafe24_headers(), params=params, timeout=15)
+        res.raise_for_status()
+        raw_products = res.json().get('products', [])
+    except Exception as e:
+        logger.exception("카페24 상품 검색 실패")
+        return jsonify({"success": False, "error": f"카페24 상품 조회 실패: {str(e)}"}), 502
+
+    products = []
+    for p in raw_products:
+        product_no = p.get('product_no')
+        main_image = p.get('detail_image') or p.get('list_image') or ''
+        filename = os.path.basename(main_image.split('?')[0]) if main_image else f"{product_no}.jpg"
+        ext = os.path.splitext(filename)[1].lstrip('.').upper() or 'JPG'
+
+        # 카페24 API 버전에 따라 추가이미지 필드명이 다를 수 있어 기본값은 빈 배열로 처리
+        add_images = [img for img in p.get('additional_image', []) if img] if isinstance(p.get('additional_image'), list) else []
+
+        products.append({
+            "product_no": str(product_no),
+            "product_code": p.get('product_code', ''),
+            "product_name": p.get('product_name', ''),
+            "image_url": main_image,
+            "filename": filename,
+            "format": ext,
+            "add_images": add_images
+        })
+
+    return jsonify({"success": True, "data": products})
+
 # [1단계 API] 썸네일 변환 (미리보기 생성)
 @app.route('/api/convert', methods=['POST'])
 def convert_thumbnails():
@@ -179,6 +246,7 @@ def convert_thumbnails():
                 "processed_filename": output_file
             })
         except Exception as e:
+            logger.exception(f"상품 변환 실패 (product_no={p_no})")
             results.append({"product_no": p_no, "status": "FAIL", "error": str(e)})
 
     return jsonify({"success": True, "data": results})
@@ -205,12 +273,7 @@ def send_to_cafe24():
 
     success_list = []
     fail_list = []
-
-    headers = {
-        "Authorization": f"Bearer {CAFE24_ACCESS_TOKEN}",
-        "Content-Type": "application/json",
-        "X-Cafe24-Api-Version": "2024-03-01"
-    }
+    headers = cafe24_headers()
 
     for item in items:
         p_no = item.get('product_no')
@@ -249,16 +312,18 @@ def send_to_cafe24():
                 images_payload["add_image"] = processed_add_urls
 
             # 3. 카페24 API 호출
-            api_url = f"https://{CAFE24_MALL_ID}.cafe24api.com/api/v2/admin/products/{p_no}"
+            api_url = f"{CAFE24_API_BASE}/products/{p_no}"
             res = requests.put(api_url, json={"request": {"images": images_payload}}, headers=headers, timeout=15)
 
             if res.status_code == 200:
                 success_list.append({"product_no": p_no, "url": ftp_main_url})
             else:
                 err_msg = res.json().get('error', {}).get('message', 'API 호출 실패')
+                logger.error(f"카페24 송신 실패 (product_no={p_no}): {err_msg}")
                 fail_list.append({"product_no": p_no, "reason": err_msg})
 
         except Exception as e:
+            logger.exception(f"카페24 송신 중 예외 발생 (product_no={p_no})")
             fail_list.append({"product_no": p_no, "reason": str(e)})
 
     return jsonify({
@@ -268,4 +333,6 @@ def send_to_cafe24():
     })
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    debug_mode = os.getenv("FLASK_DEBUG", "false").lower() == "true"
+    port = int(os.getenv("PORT", 5000))
+    app.run(host='0.0.0.0', port=port, debug=debug_mode)

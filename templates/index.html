@@ -155,48 +155,49 @@
         // }
         let productsData = [];
 
-        // 실제 상품 검색 API가 백엔드(app.py)에 아직 없어, 1/2단계 연동을 바로 시연할 수 있도록
-        // 페이지 로드시 샘플 상품 2건을 채워 넣습니다. searchProducts()가 실제 API와 연동되면
-        // 이 시드 데이터 대신 검색 결과로 productsData를 교체하면 됩니다.
-        function seedSampleProducts() {
-            productsData = [
-                {
-                    product_no: '1001',
-                    product_code: 'P000A001',
-                    product_name: '샘플 상품 - 니트 원피스',
-                    image_url: 'https://picsum.photos/id/1005/1000/1000',
-                    filename: '1001.jpg',
-                    format: 'JPG',
-                    add_images: ['https://picsum.photos/id/1011/1000/1000', 'https://picsum.photos/id/1027/1000/1000'],
-                    preview_url: null,
-                    processed_filename: null,
-                    status: '조회 완료'
-                },
-                {
-                    product_no: '1002',
-                    product_code: 'P000A002',
-                    product_name: '샘플 상품 - 애니메이션 상세컷',
-                    image_url: "https://www.w3schools.com/tags/smiley.gif",
-                    filename: '1002.gif',
-                    format: 'GIF',
-                    add_images: [],
-                    preview_url: null,
-                    processed_filename: null,
-                    status: '조회 완료'
-                }
-            ];
-            renderProductTable();
-        }
-
         function toggleSelectAll() {
             const isChecked = document.getElementById('selectAll').checked;
             document.querySelectorAll('.product-check').forEach(cb => cb.checked = isChecked);
         }
 
-        function searchProducts() {
-            // TODO: app.py에 상품 검색 API(GET/POST /api/products 등)가 추가되면 fetch로 교체
-            alert('백엔드에 상품 검색 API가 아직 없어 샘플 데이터로 대체합니다. (연동 시 이 함수만 교체하면 됩니다)');
-            seedSampleProducts();
+        // GET /api/products/search 호출 - 카페24 Admin API 기반 상품 검색
+        async function searchProducts() {
+            const searchType = document.getElementById('searchType').value;
+            const keyword = document.getElementById('searchInput').value.trim();
+            const limit = document.getElementById('pageSize').value;
+
+            if (!keyword) {
+                alert('검색어를 입력해 주세요.');
+                return;
+            }
+
+            const searchBtn = document.getElementById('searchBtn');
+            searchBtn.disabled = true;
+            searchBtn.classList.add('opacity-50', 'cursor-not-allowed');
+
+            try {
+                const params = new URLSearchParams({ search_type: searchType, keyword, limit });
+                const res = await fetch(`/api/products/search?${params.toString()}`);
+                const json = await res.json();
+
+                if (!res.ok || !json.success) {
+                    alert(json.error || '상품 조회에 실패했습니다.');
+                    return;
+                }
+
+                productsData = (json.data || []).map(p => ({
+                    ...p,
+                    preview_url: null,
+                    processed_filename: null,
+                    status: '조회 완료'
+                }));
+                renderProductTable();
+            } catch (e) {
+                alert(`상품 조회 중 오류가 발생했습니다: ${e.message}`);
+            } finally {
+                searchBtn.disabled = false;
+                searchBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+            }
         }
 
         // ==========================================
@@ -486,7 +487,7 @@
             await sendItemsToCafe24(retryTargets);
         }
 
-        // 초기 진입 시 샘플 상품으로 화면을 채워 1/2단계 버튼을 바로 테스트할 수 있게 함
+        // 초기 진입 시 빈 상태(검색 안내 문구) 렌더링
         renderProductTable();
     </script>
 </body>

@@ -57,7 +57,11 @@ def pad_to_1400_ratio(img, target_w=1000, target_h=1400, bg_color=(255, 255, 255
     paste_x = (target_w - new_w) // 2
     paste_y = (target_h - new_h) // 2
     background.paste(resized_img, (paste_x, paste_y), resized_img)
-    
+
+    # 최종 Output 사이즈가 정확히 (target_w, target_h)인지 보정
+    if background.size != (target_w, target_h):
+        background = background.resize((target_w, target_h), Image.Resampling.LANCZOS)
+
     return background.convert('RGB')
 
 
@@ -77,7 +81,11 @@ def crop_to_1400_ratio(img, target_w=1000, target_h=1400):
     left = (new_w - target_w) // 2
     top = (new_h - target_h) // 2
     cropped = resized_img.crop((left, top, left + target_w, top + target_h))
-    
+
+    # 최종 Output 사이즈가 정확히 (target_w, target_h)인지 보정
+    if cropped.size != (target_w, target_h):
+        cropped = cropped.resize((target_w, target_h), Image.Resampling.LANCZOS)
+
     return cropped.convert('RGB')
 
 def process_image_bytes(image_bytes, filename, mode='product'):

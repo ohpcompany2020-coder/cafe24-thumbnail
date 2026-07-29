@@ -26,7 +26,7 @@ FTP_BASE_URL = f"http://{CAFE24_MALL_ID}.cafe24.com/web/upload/thumbnail/"
 # 1:1 -> 1:1.4 (1000x1400) 가공 로직
 # ==========================================
 def pad_to_1400_ratio(img, target_w=1000, target_h=1400):
-    """1:1 이미지를 1000x1400 Canvas 중앙에 배치 (상하 여백 흰색 채움)"""
+    """[product 모드] 1:1 이미지를 1000x1400 Canvas 중앙에 배치 (상하 여백 흰색 채움)"""
     img = img.convert('RGBA')
     orig_w, orig_h = img.size
 
@@ -43,8 +43,31 @@ def pad_to_1400_ratio(img, target_w=1000, target_h=1400):
     canvas.paste(img, (0, offset_y), mask=img if img.mode == 'RGBA' else None)
     return canvas.convert('RGB')
 
-def process_image_bytes(image_bytes, filename):
-    """GIF Multi-frame / JPG / PNG 처리"""
+def crop_to_1400_ratio(img, target_w=1000, target_h=1400):
+    """[model 모드] 1000x1400 비율을 꽉 채우도록 확대(비율 유지) 후 중앙 기준 가로 크롭"""
+    img = img.convert('RGBA')
+    orig_w, orig_h = img.size
+
+    # 타겟 박스를 여백 없이 덮을 때까지 확대 (cover 방식)
+    scale = max(target_w / orig_w, target_h / orig_h)
+    new_w = max(target_w, round(orig_w * scale))
+    new_h = max(target_h, round(orig_h * scale))
+    img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+    # 중앙 기준으로 목표 사이즈만큼 절삭 (가로가 남는 경우 좌우를, 세로가 남는 경우 상하를 절삭)
+    left = (new_w - target_w) // 2
+    top = (new_h - target_h) // 2
+    img = img.crop((left, top, left + target_w, top + target_h))
+    return img.convert('RGB')
+
+def process_image_bytes(image_bytes, filename, mode='product'):
+    """GIF Multi-frame / JPG / PNG 처리
+
+    mode='product' -> pad_to_1400_ratio (상하 여백 채우기)
+    mode='model'   -> crop_to_1400_ratio (확대 후 중앙 가로 크롭)
+    """
+    process_fn = crop_to_1400_ratio if mode == 'model' else pad_to_1400_ratio
+
     ext = os.path.splitext(filename)[1].lower()
     img = Image.open(io.BytesIO(image_bytes))
     output_filename = f"processed_{filename}"
@@ -55,7 +78,7 @@ def process_image_bytes(image_bytes, filename):
         durations = []
         for frame in ImageSequence.Iterator(img):
             durations.append(frame.info.get('duration', 100))
-            frames.append(pad_to_1400_ratio(frame))
+            frames.append(process_fn(frame))
 
         frames[0].save(
             output_path,
@@ -65,7 +88,7 @@ def process_image_bytes(image_bytes, filename):
             loop=0
         )
     else:
-        processed_img = pad_to_1400_ratio(img)
+        processed_img = process_fn(img)
         processed_img.save(output_path, quality=95)
 
     return output_filename
@@ -105,6 +128,7 @@ def serve_processed_image(filename):
 @app.route('/api/convert', methods=['POST'])
 def convert_thumbnails():
     data = request.json or {}
+    mode = data.get('mode', 'product')  # 'product' -> 상하 여백 채우기 / 'model' -> 확대 후 중앙 가로 크롭
     products = data.get('products', [])
     results = []
 
@@ -117,7 +141,7 @@ def convert_thumbnails():
             resp = requests.get(img_url, timeout=10)
             resp.raise_for_status()
 
-            output_file = process_image_bytes(resp.content, filename)
+            output_file = process_image_bytes(resp.content, filename, mode)
             preview_url = f"/static/processed_images/{output_file}"
 
             results.append({
@@ -188,7 +212,7 @@ def send_to_cafe24():
                     add_resp.raise_for_status()
 
                     add_filename = f"{p_no}_add_{idx}.jpg"
-                    out_add_file = process_image_bytes(add_resp.content, add_filename)
+                    out_add_file = process_image_bytes(add_resp.content, add_filename, 'product')
                     out_add_path = os.path.join(UPLOAD_FOLDER, out_add_file)
 
                     ftp_add_url = upload_to_ftp(out_add_path, out_add_file)

@@ -176,7 +176,7 @@
                     product_no: '1002',
                     product_code: 'P000A002',
                     product_name: '샘플 상품 - 애니메이션 상세컷',
-                    image_url: 'https://picsum.photos/id/1005/1000/1000.gif',
+                    image_url: "https://media.giphy.com/media/26n60u5771G58a5mE/giphy.gif",
                     filename: '1002.gif',
                     format: 'GIF',
                     add_images: [],
@@ -282,8 +282,8 @@
                     </td>
                     <td class="p-4 text-center bg-indigo-50/30" id="preview-cell-${p.product_no}">
                         ${p.preview_url
-                            ? `<img src="${p.preview_url}?t=${Date.now()}" alt="변환 미리보기" class="w-16 h-[22.4px] object-cover rounded border border-indigo-200 mx-auto bg-white">`
-                            : `<div class="w-16 h-[22.4px] bg-indigo-100/50 border border-indigo-200 rounded mx-auto flex items-center justify-center text-[10px] text-indigo-400 font-mono">미변환</div>`}
+                            ? `<img src="${p.preview_url}?t=${Date.now()}" alt="변환 미리보기" class="w-16 h-[89.6px] object-cover rounded border border-indigo-200 mx-auto bg-white">`
+                            : `<div class="w-16 h-[89.6px] bg-indigo-100/50 border border-indigo-200 rounded mx-auto flex items-center justify-center text-[10px] text-indigo-400 font-mono">미변환</div>`}
                     </td>
                     <td class="p-4">
                         <div class="font-semibold text-slate-800">${p.product_name}</div>

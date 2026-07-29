@@ -35,7 +35,9 @@ CAFE24_ACCESS_TOKEN = os.getenv("CAFE24_ACCESS_TOKEN", "your_access_token")
 CAFE24_REFRESH_TOKEN = os.getenv("CAFE24_REFRESH_TOKEN", "")
 CAFE24_CLIENT_ID = os.getenv("CAFE24_CLIENT_ID", "")
 CAFE24_CLIENT_SECRET = os.getenv("CAFE24_CLIENT_SECRET", "")
-CAFE24_API_VERSION = os.getenv("CAFE24_API_VERSION", "2024-03-01")
+# 카페24 개발자센터 기준 최신 API 버전(YYYY-MM-DD). 카페24가 주기적으로 버전을 갱신하므로
+# https://developers.cafe24.com 의 버전 안내를 주기적으로 확인해 CAFE24_API_VERSION로 갱신할 것.
+CAFE24_API_VERSION = os.getenv("CAFE24_API_VERSION", "2026-03-01")
 CAFE24_API_BASE = f"https://{CAFE24_MALL_ID}.cafe24api.com/api/v2/admin"
 CAFE24_TOKEN_URL = f"https://{CAFE24_MALL_ID}.cafe24api.com/api/v2/oauth/token"
 CAFE24_AUTHORIZE_URL = f"https://{CAFE24_MALL_ID}.cafe24api.com/api/v2/oauth/authorize"
@@ -346,6 +348,7 @@ def cafe24_auth_callback():
 # [상품 검색 API] 카페24 Admin API로 상품 목록 조회
 @app.route('/api/products/search', methods=['GET'])
 def search_products():
+    # model_name은 카페24 API 자체 파라미터가 아니라 UI상의 별칭이며, 아래에서 product_name으로 매핑된다
     search_type = request.args.get('search_type', 'product_name')  # model_name | product_name | product_code
     keyword = request.args.get('keyword', '').strip()
     limit = min(int(request.args.get('limit', 20)), 100)
@@ -354,16 +357,40 @@ def search_products():
         return jsonify({"success": False, "error": "검색어를 입력해 주세요."}), 400
 
     params = {"limit": limit}
-    if search_type == 'model_name':
-        params['model_name'] = keyword
-    elif search_type == 'product_code':
+    if search_type == 'product_code':
         params['product_code'] = keyword
+    elif search_type == 'model_name':
+        # 카페24 Admin API GET /admin/products에는 "model_name" 파라미터가 존재하지 않는다
+        # (공식 문서상 product_name / product_code / custom_product_code 등만 지원).
+        # 잘못된 파라미터를 그대로 보내면 400 Bad Request가 발생하므로, 가장 가까운
+        # 대체 필드인 product_name으로 검색한다. (모델명이 상품명에 포함되는 몰 운영 관행 기준)
+        logger.warning(f"'model_name' 검색은 카페24 API에 없는 파라미터입니다. product_name으로 대체 검색합니다. (keyword={keyword})")
+        params['product_name'] = keyword
     else:
         params['product_name'] = keyword
 
     try:
         res = cafe24_api_request('GET', f"{CAFE24_API_BASE}/products", params=params, timeout=15)
-        res.raise_for_status()
+
+        if res.status_code >= 400:
+            try:
+                err_body = res.json()
+            except ValueError:
+                err_body = {}
+            cafe24_error = err_body.get('error') or {}
+            detail_msg = (
+                (cafe24_error.get('message') if isinstance(cafe24_error, dict) else None)
+                or err_body.get('error_description')
+                or res.text
+                or f"HTTP {res.status_code}"
+            )
+            logger.error(f"카페24 상품 검색 실패 ({res.status_code}) url={res.url} body={res.text}")
+            return jsonify({
+                "success": False,
+                "error": f"카페24 상품 조회 실패 ({res.status_code}): {detail_msg}",
+                "status_code": res.status_code
+            }), 502
+
         raw_products = res.json().get('products', [])
     except Cafe24ReauthRequired as e:
         logger.error(f"카페24 재인증 필요: {e}")
@@ -375,8 +402,8 @@ def search_products():
             **({"reauth_url": reauth_url} if reauth_url else {})
         }), 401
     except Exception as e:
-        logger.exception("카페24 상품 검색 실패")
-        return jsonify({"success": False, "error": f"카페24 상품 조회 실패: {str(e)}"}), 502
+        logger.exception("카페24 상품 검색 요청 중 예외 발생")
+        return jsonify({"success": False, "error": f"카페24 상품 조회 중 오류가 발생했습니다: {str(e)}"}), 502
 
     products = []
     for p in raw_products:

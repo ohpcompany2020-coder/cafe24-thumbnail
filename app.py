@@ -9,6 +9,7 @@ import requests
 from urllib.parse import urlencode
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, render_template, send_from_directory
+from werkzeug.exceptions import HTTPException
 from PIL import Image, ImageSequence
 
 load_dotenv()
@@ -23,6 +24,17 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(e):
+    """API 라우트에서 처리하지 못한 예외가 Flask 기본 HTML 에러 페이지로 새어나가지 않도록
+    항상 JSON으로 응답한다. (프런트가 res.json()을 그대로 파싱하므로 HTML이 내려가면
+    "Unexpected token '<'" 같은 파싱 에러로 이어짐)"""
+    if isinstance(e, HTTPException):
+        return e
+    logger.exception("처리되지 않은 예외로 요청 실패")
+    return jsonify({"success": False, "error": f"서버 내부 오류가 발생했습니다: {str(e)}"}), 500
 
 # ==========================================
 # 환경 설정 (.env 환경변수 활용)
@@ -392,6 +404,36 @@ def search_products():
             }), 502
 
         raw_products = res.json().get('products', [])
+        if not isinstance(raw_products, list):
+            raw_products = []
+
+        products = []
+        for p in raw_products:
+            if not isinstance(p, dict):
+                continue
+
+            product_no = p.get('product_no')
+            main_image = p.get('detail_image') or p.get('list_image') or ''
+            main_image = main_image if isinstance(main_image, str) else ''
+            filename = os.path.basename(main_image.split('?')[0]) if main_image else f"{product_no}.jpg"
+            ext = os.path.splitext(filename)[1].lstrip('.').upper() or 'JPG'
+
+            # 카페24 API 버전에 따라 추가이미지 필드명이 다를 수 있어 기본값은 빈 배열로 처리
+            raw_add_images = p.get('additional_image')
+            add_images = [img for img in raw_add_images if img] if isinstance(raw_add_images, list) else []
+
+            products.append({
+                "product_no": str(product_no),
+                "product_code": p.get('product_code', ''),
+                "product_name": p.get('product_name', ''),
+                "image_url": main_image,
+                "filename": filename,
+                "format": ext,
+                "add_images": add_images
+            })
+
+        return jsonify({"success": True, "data": products})
+
     except Cafe24ReauthRequired as e:
         logger.error(f"카페24 재인증 필요: {e}")
         reauth_url = get_cafe24_reauth_url()
@@ -404,28 +446,6 @@ def search_products():
     except Exception as e:
         logger.exception("카페24 상품 검색 요청 중 예외 발생")
         return jsonify({"success": False, "error": f"카페24 상품 조회 중 오류가 발생했습니다: {str(e)}"}), 502
-
-    products = []
-    for p in raw_products:
-        product_no = p.get('product_no')
-        main_image = p.get('detail_image') or p.get('list_image') or ''
-        filename = os.path.basename(main_image.split('?')[0]) if main_image else f"{product_no}.jpg"
-        ext = os.path.splitext(filename)[1].lstrip('.').upper() or 'JPG'
-
-        # 카페24 API 버전에 따라 추가이미지 필드명이 다를 수 있어 기본값은 빈 배열로 처리
-        add_images = [img for img in p.get('additional_image', []) if img] if isinstance(p.get('additional_image'), list) else []
-
-        products.append({
-            "product_no": str(product_no),
-            "product_code": p.get('product_code', ''),
-            "product_name": p.get('product_name', ''),
-            "image_url": main_image,
-            "filename": filename,
-            "format": ext,
-            "add_images": add_images
-        })
-
-    return jsonify({"success": True, "data": products})
 
 # [1단계 API] 썸네일 변환 (미리보기 생성)
 @app.route('/api/convert', methods=['POST'])

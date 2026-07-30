@@ -243,6 +243,25 @@ def fetch_image(url, timeout=10):
     resp.raise_for_status()
     return resp
 
+def verify_image_dimensions(product_no, field_name, image_url, expected_ratio=1.4, tolerance=0.02):
+    """카페24가 실제로 반영한 이미지 URL을 다시 받아 PIL로 실제 크기/비율을 로그로 남긴다.
+    CDN 캐시로 예전 이미지가 그대로 보이는 경우와, 애초에 잘못된 필드/이미지가
+    올라간 경우를 구분하기 위한 진단용 로그."""
+    try:
+        resp = requests.get(image_url, timeout=10)
+        resp.raise_for_status()
+        with Image.open(io.BytesIO(resp.content)) as img:
+            w, h = img.size
+        ratio = (h / w) if w else 0
+        ok = abs(ratio - expected_ratio) <= tolerance
+        logger.info(
+            f"[크기 검증] product_no={product_no} field={field_name} url={image_url} "
+            f"size={w}x{h} ratio={ratio:.3f} (기대값 {expected_ratio}) "
+            f"{'OK' if ok else 'MISMATCH - 여전히 구 이미지이거나 다른 필드일 가능성'}"
+        )
+    except Exception as e:
+        logger.warning(f"[크기 검증 실패] product_no={product_no} field={field_name} url={image_url}: {e}")
+
 def process_image_bytes(image_bytes, filename, mode='product'):
     """GIF Multi-frame / JPG / PNG 처리
 
@@ -538,8 +557,15 @@ def send_to_cafe24():
             # 1. 대표 썸네일 FTP 업로드
             ftp_main_url = upload_to_ftp(local_path, filename)
 
+            # 카페24 이미지 필드는 용도별로 분리되어 있어, 대표 이미지 하나만 바꾸려면
+            # 노출되는 모든 필드(list_image=목록/카테고리, tiny/small=검색·장바구니 등)를
+            # 함께 갱신해야 한다. detail_image/big_image만 갱신하면 목록 페이지는
+            # list_image를 그대로 쓰기 때문에 1:1 원본이 계속 보인다.
             images_payload = {
                 "detail_image": ftp_main_url,
+                "list_image": ftp_main_url,
+                "tiny_image": ftp_main_url,
+                "small_image": ftp_main_url,
                 "big_image": ftp_main_url
             }
 
@@ -565,13 +591,21 @@ def send_to_cafe24():
                 images_payload["add_image"] = processed_add_urls
 
             # 3. 카페24 API 호출
+            logger.info(f"[업로드 URL] product_no={p_no} FTP 업로드 실제 URL: {ftp_main_url}")
+
             api_url = f"{CAFE24_API_BASE}/products/{p_no}"
             res = cafe24_api_request('PUT', api_url, json={"request": {"images": images_payload}}, timeout=15)
+            res_json = res.json()
+            logger.info(f"[카페24 응답] product_no={p_no} status={res.status_code} body={res_json}")
 
             if res.status_code == 200:
                 success_list.append({"product_no": p_no, "url": ftp_main_url})
+
+                returned_product = res_json.get('product', {}) if isinstance(res_json.get('product'), dict) else {}
+                returned_list_image = returned_product.get('list_image') or ftp_main_url
+                verify_image_dimensions(p_no, 'list_image', returned_list_image)
             else:
-                err_msg = res.json().get('error', {}).get('message', 'API 호출 실패')
+                err_msg = res_json.get('error', {}).get('message', 'API 호출 실패')
                 logger.error(f"카페24 송신 실패 (product_no={p_no}): {err_msg}")
                 fail_list.append({"product_no": p_no, "reason": err_msg})
 

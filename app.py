@@ -7,8 +7,7 @@ import logging
 import threading
 import ftplib
 import requests
-from datetime import datetime
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlencode
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, render_template, send_from_directory
 from werkzeug.exceptions import HTTPException
@@ -44,6 +43,13 @@ def handle_unexpected_error(e):
 UPLOAD_FOLDER = os.path.join(app.root_path, 'static', 'processed_images')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
+# 이 앱이 배포된(Render) 공개 주소. /static/processed_images/<filename>가 이미 이 주소로
+# HTTPS 공개 서빙되고 있으므로, FTP 없이 카페24에 바로 이 URL을 넘겨보기 위해 사용.
+APP_PUBLIC_BASE_URL = os.getenv(
+    "APP_PUBLIC_BASE_URL",
+    os.getenv("RENDER_EXTERNAL_URL", "https://cafe24-thumbnail.onrender.com")
+).rstrip('/')
+
 CAFE24_MALL_ID = os.getenv("CAFE24_MALL_ID", "your_mall_id")
 CAFE24_ACCESS_TOKEN = os.getenv("CAFE24_ACCESS_TOKEN", "your_access_token")
 CAFE24_REFRESH_TOKEN = os.getenv("CAFE24_REFRESH_TOKEN", "")
@@ -66,12 +72,6 @@ FTP_USER = os.getenv("FTP_USER", "your_ftp_id")
 FTP_PASS = os.getenv("FTP_PASS", "your_ftp_password")
 FTP_PORT = int(os.getenv("FTP_PORT", 21))
 FTP_HOST_URL = f"http://{CAFE24_MALL_ID}.cafe24.com"
-# 임의로 만든 "/web/upload/thumbnail/" 폴더는 카페24 상품 이미지 등록 API가
-# "Wrong image path"로 거부한다. 실제 정상 노출되는 상품 이미지들이
-# "/web/product/{사이즈}/{년월}/{파일명}" 구조를 따르는 것을 확인하여, 대표 이미지는
-# 이 규칙에 맞춰 업로드한다.
-def product_image_upload_dir():
-    return f"/web/product/big/{datetime.now().strftime('%Y%m')}/"
 
 if "your_" in CAFE24_MALL_ID or "your_" in CAFE24_ACCESS_TOKEN:
     logger.warning("CAFE24_MALL_ID / CAFE24_ACCESS_TOKEN이 기본값입니다. .env에 실제 운영 값을 설정해 주세요.")
@@ -627,10 +627,12 @@ def send_to_cafe24():
         local_path = os.path.join(UPLOAD_FOLDER, filename)
 
         try:
-            # 1. 대표 썸네일 FTP 업로드 - 카페24 상품 이미지 등록 API가 인식하는
-            # "/web/product/{사이즈}/{년월}/" 폴더 구조에 맞춰 업로드한다.
-            ftp_main_url = upload_to_ftp(local_path, filename, remote_dir=product_image_upload_dir())
-            logger.info(f"[업로드 URL] product_no={p_no} FTP 업로드 실제 URL: {ftp_main_url}")
+            # 1. 대표 썸네일: FTP 계정이 pwd()조차 "Permission denied"로 거부해서
+            # (계정 권한 문제로 코드로는 해결 불가) FTP 업로드를 완전히 건너뛴다.
+            # 이 앱이 이미 /static/processed_images/<filename>를 공개 HTTPS로 서빙하고
+            # 있으므로 그 공개 URL을 그대로 카페24에 전달해본다.
+            public_image_url = f"{APP_PUBLIC_BASE_URL}/static/processed_images/{filename}"
+            logger.info(f"[공개 URL] product_no={p_no} 카페24에 전달할 공개 URL: {public_image_url}")
 
             # 2. 대표 이미지 갱신: detail_image/list_image/tiny_image 등은 상품 PUT의
             # "쓰기 가능한" 파라미터가 아니라 읽기 전용 응답 속성이다 (카페24가 200을
@@ -639,52 +641,32 @@ def send_to_cafe24():
             # list/detail/big을 서버에서 직접 재생성하는 전용 리소스
             # (POST /products/images, "Products images")를 제공하므로 이걸 사용한다.
             #
-            # 스키마는 실제 카페24 응답의 에러들을 대조해서 확정함:
+            # 스키마/값 형식 확인 이력:
             #   1차: {"shop_no":1,"requests":[{"product_no":..,"request_url":..}]}
             #        -> 422 "[Product image] is a required field. (parameter.image[0])"
             #   2차: {"shop_no":1,"image":[{"product_no":..,"request_url":..}]}
             #        -> 422 "Please enter the Requests parameter."
-            #   3차: {"shop_no":1,"requests":[{"product_no":..,"image":"http://전체URL"}]}
-            #        -> 422 "[Upload Image] Wrong image path" (경로 형식을 상대/https로
-            #           바꿔도 동일하게 실패 - 폴더 자체가 문제였음)
-            # 기존 정상 노출 이미지들이 "/web/product/{사이즈}/{년월}/{파일명}" 구조를 쓰는 것을
-            # 확인하여, FTP 업로드 폴더를 "/web/upload/thumbnail/"에서 이 구조로 변경함
-            # (product_image_upload_dir()). 값 형식은 여전히 상대경로 -> https 순으로 시도.
-            parsed_ftp_url = urlparse(ftp_main_url)
-            relative_image_path = parsed_ftp_url.path
-            https_image_url = f"https://{parsed_ftp_url.netloc}{parsed_ftp_url.path}"
-            image_value_candidates = [relative_image_path, https_image_url]
-
-            logger.info(
-                f"[FTP 경로 확인] product_no={p_no} FTP 저장 상대경로={relative_image_path} "
-                f"(upload_to_ftp가 반환한 원본 URL과 동일 호스트/경로에서 파생됨: {ftp_main_url})"
-            )
-
+            #   3차: {"shop_no":1,"requests":[{"product_no":..,"image":"http://newohpcompany.../web/upload/..."}]}
+            #        -> 422 "[Upload Image] Wrong image path" (상대경로/https로 바꿔도 동일)
+            #   4차: FTP 업로드 폴더를 /web/product/big/{yyyymm}/로 바꿔 재시도하려 했으나
+            #        FTP 계정 자체가 pwd()도 거부 -> FTP 완전 우회로 전환
+            # 카페24 자사 도메인이 아닌 완전 외부 HTTPS URL(Render)을 그대로 image 값으로
+            # 전달하는 이번 시도가 성공하는지는 공식 문서로 확정하지 못해 실제 응답으로 확인.
             image_upload_url = f"{CAFE24_API_BASE}/products/images"
-            img_res = None
-            img_res_json = None
-            img_err_msg = None
+            image_upload_body = {
+                "shop_no": 1,
+                "requests": [
+                    {"product_no": int(p_no), "image": public_image_url}
+                ]
+            }
+            logger.info(f"[카페24 이미지 등록 요청] product_no={p_no} url={image_upload_url} payload={image_upload_body}")
 
-            for candidate in image_value_candidates:
-                image_upload_body = {
-                    "shop_no": 1,
-                    "requests": [
-                        {"product_no": int(p_no), "image": candidate}
-                    ]
-                }
-                logger.info(f"[카페24 이미지 등록 요청] product_no={p_no} url={image_upload_url} payload={image_upload_body}")
-
-                img_res = cafe24_api_request('POST', image_upload_url, json=image_upload_body, timeout=15)
-                img_res_json = img_res.json()
-                logger.info(f"[카페24 이미지 등록 응답] product_no={p_no} status={img_res.status_code} body={img_res_json}")
-
-                if img_res.status_code in (200, 201):
-                    break
-
-                img_err_msg = extract_cafe24_error_message(img_res_json, '이미지 등록 API 호출 실패')
-                logger.warning(f"[카페24 이미지 등록 실패] product_no={p_no} candidate={candidate} reason={img_err_msg} - 다음 후보로 재시도")
+            img_res = cafe24_api_request('POST', image_upload_url, json=image_upload_body, timeout=15)
+            img_res_json = img_res.json()
+            logger.info(f"[카페24 이미지 등록 응답] product_no={p_no} status={img_res.status_code} body={img_res_json}")
 
             if img_res.status_code not in (200, 201):
+                img_err_msg = extract_cafe24_error_message(img_res_json, '이미지 등록 API 호출 실패')
                 logger.error(f"카페24 이미지 등록 실패 (product_no={p_no}): {img_err_msg}")
                 fail_list.append({"product_no": p_no, "reason": img_err_msg})
                 continue
@@ -720,7 +702,7 @@ def send_to_cafe24():
             logger.info(f"[카페24 응답] product_no={p_no} status={res.status_code} body={res_json}")
 
             if res.status_code == 200:
-                success_list.append({"product_no": p_no, "url": ftp_main_url})
+                success_list.append({"product_no": p_no, "url": public_image_url})
 
                 # 실제로 반영된 list_image를 카페24에 직접 재조회해서 검증한다.
                 # (이미지 등록 API 응답의 필드명을 확신할 수 없으므로, 항상 정확한

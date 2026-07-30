@@ -596,20 +596,35 @@ def send_to_cafe24():
         try:
             # 1. 대표 썸네일 FTP 업로드
             ftp_main_url = upload_to_ftp(local_path, filename)
+            logger.info(f"[업로드 URL] product_no={p_no} FTP 업로드 실제 URL: {ftp_main_url}")
 
-            # 카페24 이미지 필드는 용도별로 분리되어 있어, 대표 이미지 하나만 바꾸려면
-            # 노출되는 모든 필드(list_image=목록/카테고리, tiny/small=검색·장바구니 등)를
-            # 함께 갱신해야 한다. detail_image/big_image만 갱신하면 목록 페이지는
-            # list_image를 그대로 쓰기 때문에 1:1 원본이 계속 보인다.
-            images_payload = {
-                "detail_image": ftp_main_url,
-                "list_image": ftp_main_url,
-                "tiny_image": ftp_main_url,
-                "small_image": ftp_main_url,
-                "big_image": ftp_main_url
+            # 2. 대표 이미지 갱신: detail_image/list_image/tiny_image 등은 상품 PUT의
+            # "쓰기 가능한" 파라미터가 아니라 읽기 전용 응답 속성이다 (카페24가 200을
+            # 반환해도 실제로는 무시함 - list_image가 안 바뀌던 원인). 카페24는 원본
+            # 이미지 1장을 등록하면 쇼핑몰의 "이미지 사이즈 설정"에 따라 tiny/small/
+            # list/detail/big을 서버에서 직접 재생성하는 전용 리소스
+            # (POST /products/images, "Products images")를 제공하므로 이걸 사용한다.
+            image_upload_url = f"{CAFE24_API_BASE}/products/images"
+            image_upload_body = {
+                "shop_no": 1,
+                "requests": [
+                    {"product_no": int(p_no), "request_url": ftp_main_url}
+                ]
             }
+            logger.info(f"[카페24 이미지 등록 요청] product_no={p_no} url={image_upload_url} payload={image_upload_body}")
 
-            # 2. 추가이미지 제어 조건
+            img_res = cafe24_api_request('POST', image_upload_url, json=image_upload_body, timeout=15)
+            img_res_json = img_res.json()
+            logger.info(f"[카페24 이미지 등록 응답] product_no={p_no} status={img_res.status_code} body={img_res_json}")
+
+            if img_res.status_code not in (200, 201):
+                err_msg = img_res_json.get('error', {}).get('message', '이미지 등록 API 호출 실패')
+                logger.error(f"카페24 이미지 등록 실패 (product_no={p_no}): {err_msg}")
+                fail_list.append({"product_no": p_no, "reason": err_msg})
+                continue
+
+            # 3. 추가이미지 제어 조건 (기존 상품 PUT 그대로 유지 - add_image는 별도 필드)
+            images_payload = {}
             if mode == 'model':
                 # [모델컷 모드] 추가이미지 일괄 삭제
                 images_payload["add_image"] = []
@@ -630,9 +645,6 @@ def send_to_cafe24():
 
                 images_payload["add_image"] = processed_add_urls
 
-            # 3. 카페24 API 호출
-            logger.info(f"[업로드 URL] product_no={p_no} FTP 업로드 실제 URL: {ftp_main_url}")
-
             api_url = f"{CAFE24_API_BASE}/products/{p_no}"
             request_body = {"request": {"images": images_payload}}
             logger.info(f"[카페24 PUT 요청] product_no={p_no} url={api_url} payload={request_body}")
@@ -644,9 +656,21 @@ def send_to_cafe24():
             if res.status_code == 200:
                 success_list.append({"product_no": p_no, "url": ftp_main_url})
 
-                returned_product = res_json.get('product', {}) if isinstance(res_json.get('product'), dict) else {}
-                returned_list_image = returned_product.get('list_image') or ftp_main_url
-                verify_image_dimensions(p_no, 'list_image', returned_list_image)
+                # 실제로 반영된 list_image를 카페24에 직접 재조회해서 검증한다.
+                # (이미지 등록 API 응답의 필드명을 확신할 수 없으므로, 항상 정확한
+                # 상품 리소스 GET을 기준으로 확인 - 검증 실패는 송신 성공/실패에 영향 없음)
+                try:
+                    verify_get = cafe24_api_request(
+                        'GET', f"{CAFE24_API_BASE}/products/{p_no}",
+                        params={"fields": "list_image,detail_image"}, timeout=10
+                    )
+                    verify_products = verify_get.json().get('products', [])
+                    current_list_image = verify_products[0].get('list_image') if verify_products else None
+                    logger.info(f"[카페24 현재 list_image 재조회] product_no={p_no} list_image={current_list_image}")
+                    if current_list_image:
+                        verify_image_dimensions(p_no, 'list_image', current_list_image)
+                except Exception as verify_err:
+                    logger.warning(f"[list_image 재조회 실패] product_no={p_no}: {verify_err}")
             else:
                 err_msg = res_json.get('error', {}).get('message', 'API 호출 실패')
                 logger.error(f"카페24 송신 실패 (product_no={p_no}): {err_msg}")

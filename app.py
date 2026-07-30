@@ -781,6 +781,11 @@ def send_to_cafe24():
             logger.info(f"[카페24 이미지 등록 응답] product_no={p_no} status={img_res.status_code} body={img_res_json}")
 
             if img_res.status_code not in (200, 201):
+                trace_id = img_res.headers.get('X-Trace-Id') or img_res.headers.get('X-Trace_ID')
+                logger.error(
+                    f"[카페24 이미지 등록 응답 헤더] product_no={p_no} X-Trace-Id={trace_id} "
+                    f"전체 헤더={dict(img_res.headers)}"
+                )
                 img_err_msg = extract_cafe24_error_message(img_res_json, '이미지 등록 API 호출 실패')
                 logger.error(f"카페24 이미지 등록 실패 (product_no={p_no}): {img_err_msg}")
                 fail_list.append({"product_no": p_no, "reason": img_err_msg})

@@ -7,6 +7,7 @@ import logging
 import threading
 import ftplib
 import requests
+from datetime import datetime
 from urllib.parse import urlencode, urlparse
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, render_template, send_from_directory
@@ -64,7 +65,13 @@ FTP_HOST = os.getenv("FTP_HOST", f"{CAFE24_MALL_ID}.cafe24.com")
 FTP_USER = os.getenv("FTP_USER", "your_ftp_id")
 FTP_PASS = os.getenv("FTP_PASS", "your_ftp_password")
 FTP_PORT = int(os.getenv("FTP_PORT", 21))
-FTP_BASE_URL = f"http://{CAFE24_MALL_ID}.cafe24.com/web/upload/thumbnail/"
+FTP_HOST_URL = f"http://{CAFE24_MALL_ID}.cafe24.com"
+# 임의로 만든 "/web/upload/thumbnail/" 폴더는 카페24 상품 이미지 등록 API가
+# "Wrong image path"로 거부한다. 실제 정상 노출되는 상품 이미지들이
+# "/web/product/{사이즈}/{년월}/{파일명}" 구조를 따르는 것을 확인하여, 대표 이미지는
+# 이 규칙에 맞춰 업로드한다.
+def product_image_upload_dir():
+    return f"/web/product/big/{datetime.now().strftime('%Y%m')}/"
 
 if "your_" in CAFE24_MALL_ID or "your_" in CAFE24_ACCESS_TOKEN:
     logger.warning("CAFE24_MALL_ID / CAFE24_ACCESS_TOKEN이 기본값입니다. .env에 실제 운영 값을 설정해 주세요.")
@@ -346,23 +353,29 @@ def process_image_bytes(image_bytes, filename, mode='product'):
 
     return output_filename
 
-def upload_to_ftp(local_file_path, remote_filename):
-    """Web FTP 업로드 함수"""
+def _ftp_ensure_dir(ftp, remote_dir):
+    """remote_dir(예: '/web/product/big/202607/')이 없으면 한 단계씩 생성하며 이동한다."""
+    ftp.cwd('/')
+    for part in remote_dir.strip('/').split('/'):
+        try:
+            ftp.cwd(part)
+        except ftplib.error_perm:
+            ftp.mkd(part)
+            ftp.cwd(part)
+
+def upload_to_ftp(local_file_path, remote_filename, remote_dir='/web/upload/thumbnail/'):
+    """Web FTP 업로드 함수. remote_dir 하위(없으면 생성)에 파일을 올리고 접근 가능한 URL을 반환한다."""
     try:
         ftp = ftplib.FTP()
         ftp.connect(FTP_HOST, FTP_PORT, timeout=30)
         ftp.login(FTP_USER, FTP_PASS)
-        
-        try:
-            ftp.cwd('/web/upload/thumbnail/')
-        except ftplib.error_perm:
-            ftp.mkd('/web/upload/thumbnail/')
-            ftp.cwd('/web/upload/thumbnail/')
+
+        _ftp_ensure_dir(ftp, remote_dir)
 
         with open(local_file_path, 'rb') as f:
             ftp.storbinary(f'STOR {remote_filename}', f)
         ftp.quit()
-        return f"{FTP_BASE_URL}{remote_filename}"
+        return f"{FTP_HOST_URL}{remote_dir}{remote_filename}"
     except Exception as e:
         raise Exception(f"FTP 업로드 실패: {str(e)}")
 
@@ -605,8 +618,9 @@ def send_to_cafe24():
         local_path = os.path.join(UPLOAD_FOLDER, filename)
 
         try:
-            # 1. 대표 썸네일 FTP 업로드
-            ftp_main_url = upload_to_ftp(local_path, filename)
+            # 1. 대표 썸네일 FTP 업로드 - 카페24 상품 이미지 등록 API가 인식하는
+            # "/web/product/{사이즈}/{년월}/" 폴더 구조에 맞춰 업로드한다.
+            ftp_main_url = upload_to_ftp(local_path, filename, remote_dir=product_image_upload_dir())
             logger.info(f"[업로드 URL] product_no={p_no} FTP 업로드 실제 URL: {ftp_main_url}")
 
             # 2. 대표 이미지 갱신: detail_image/list_image/tiny_image 등은 상품 PUT의
@@ -622,9 +636,11 @@ def send_to_cafe24():
             #   2차: {"shop_no":1,"image":[{"product_no":..,"request_url":..}]}
             #        -> 422 "Please enter the Requests parameter."
             #   3차: {"shop_no":1,"requests":[{"product_no":..,"image":"http://전체URL"}]}
-            #        -> 422 "[Upload Image] Wrong image path" (전체 URL 자체가 잘못됐다는 뜻)
-            # -> 최상위 키 "requests", 내부 필드명 "image"까지는 확정. 값 형식만 남았으므로
-            # FTP 저장 경로 기준 "도메인 없는 상대경로" -> 안 되면 "https 전체 URL" 순으로 시도.
+            #        -> 422 "[Upload Image] Wrong image path" (경로 형식을 상대/https로
+            #           바꿔도 동일하게 실패 - 폴더 자체가 문제였음)
+            # 기존 정상 노출 이미지들이 "/web/product/{사이즈}/{년월}/{파일명}" 구조를 쓰는 것을
+            # 확인하여, FTP 업로드 폴더를 "/web/upload/thumbnail/"에서 이 구조로 변경함
+            # (product_image_upload_dir()). 값 형식은 여전히 상대경로 -> https 순으로 시도.
             parsed_ftp_url = urlparse(ftp_main_url)
             relative_image_path = parsed_ftp_url.path
             https_image_url = f"https://{parsed_ftp_url.netloc}{parsed_ftp_url.path}"

@@ -7,7 +7,6 @@ import logging
 import threading
 import ftplib
 import requests
-from datetime import datetime
 from urllib.parse import urlencode
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, render_template, send_from_directory
@@ -69,13 +68,10 @@ FTP_USER = os.getenv("FTP_USER", "your_ftp_id")
 FTP_PASS = os.getenv("FTP_PASS", "your_ftp_password")
 FTP_PORT = int(os.getenv("FTP_PORT", 21))
 FTP_HOST_URL = f"http://{CAFE24_MALL_ID}.cafe24.com"
-
-# FTP 연결 자체는 정상 동작이 확인됐다 (/api/debug/ftp-test: cwd/nlst/STOR 모두 성공,
-# pwd()만 이 계정에서 예외적으로 거부됨). 실제 정상 노출되는 상품 이미지들이
-# "/web/product/{사이즈}/{년월}/{파일명}" 구조를 따르므로, 대표 이미지도 이 규칙에
-# 맞춰 업로드한다.
-def product_image_upload_dir():
-    return f"/web/product/big/{datetime.now().strftime('%Y%m')}/"
+# 카페24 고객센터 확인: "/web/product/..."는 카페24 시스템이 자체 관리하는 상품이미지
+# 전용 폴더라 일반 FTP 계정에는 쓰기 권한이 없다. 공식 안내는 "web 폴더 바로 하위에
+# 원하는 이름의 폴더를 새로 만들어 쓰라"는 것이었고, 이미 성공이 확인된
+# "/web/upload/thumbnail/"이 바로 그 원칙에 맞는 폴더이므로 대표 이미지도 이 폴더를 쓴다.
 
 if "your_" in CAFE24_MALL_ID or "your_" in CAFE24_ACCESS_TOKEN:
     logger.warning("CAFE24_MALL_ID / CAFE24_ACCESS_TOKEN이 기본값입니다. .env에 실제 운영 값을 설정해 주세요.")
@@ -728,11 +724,13 @@ def send_to_cafe24():
         local_path = os.path.join(UPLOAD_FOLDER, filename)
 
         try:
-            # 1. 대표 썸네일 FTP 업로드. FTP는 정상 동작이 확인됐다
-            # (/api/debug/ftp-test: cwd/nlst/STOR 전부 성공, pwd()만 이 계정에서
-            # 예외적으로 거부됨 - upload_to_ftp도 pwd 실패를 무시하고 진행함).
-            # 실제 정상 노출 이미지들과 같은 "/web/product/{사이즈}/{년월}/" 구조로 올린다.
-            remote_dir = product_image_upload_dir()
+            # 1. 대표 썸네일 FTP 업로드. 카페24 고객센터 확인: "/web/product/..."는
+            # 카페24 시스템이 자체 관리하는 상품이미지 전용 폴더라 일반 FTP 계정에는
+            # 쓰기 권한이 없다 (실제로 그 경로에 STOR 시도 시 550 Permission denied).
+            # 공식 안내는 "web 폴더 바로 하위에 원하는 이름의 폴더를 새로 만들어 쓰라"는
+            # 것이었고, 이미 성공이 확인된 "/web/upload/thumbnail/"이 그 원칙에 맞는
+            # 폴더이므로 대표 이미지도 이 폴더(upload_to_ftp 기본값)를 그대로 쓴다.
+            remote_dir = '/web/upload/thumbnail/'
             ftp_main_url = upload_to_ftp(local_path, filename, remote_dir=remote_dir)
             relative_image_path = f"{remote_dir}{filename}"
             logger.info(
@@ -753,14 +751,17 @@ def send_to_cafe24():
             #        -> 422 "[Product image] is a required field. (parameter.image[0])"
             #   2차: {"shop_no":1,"image":[{"product_no":..,"request_url":..}]}
             #        -> 422 "Please enter the Requests parameter."
-            #   3차: {"shop_no":1,"requests":[{"product_no":..,"image":"http://newohpcompany.../web/upload/..."}]}
-            #        -> 422 "[Upload Image] Wrong image path" (상대경로/https로 바꿔도 동일 -
-            #        당시엔 FTP 폴더가 /web/upload/thumbnail/라 실제 상품 이미지 경로 구조와 달랐음)
-            #   4차: FTP 계정이 pwd()로 거부당해 계정 문제로 오인, 잠시 Render가 서빙하는
-            #        외부 HTTPS URL로 우회를 시도했으나(성공/실패 미검증) FTP 자체가
-            #        FTP_HOST 설정 오류(".ftp." 누락)였을 뿐 정상 동작함이 확인되어 폐기
+            #   3차: {"shop_no":1,"requests":[{"product_no":..,"image":"/web/upload/thumbnail/..."}]}
+            #        -> 422 "[Upload Image] Wrong image path" - 이 시점엔 FTP_HOST 기본값에
+            #        ".ftp."가 빠져 있어 업로드가 실제로는 엉뚱한 곳으로 갔을 가능성이 높음
+            #        (폴더 자체는 카페24 고객센터가 이후 이 방식이 맞다고 확인해줌)
+            #   4차: FTP 계정이 pwd()로 거부당해 계정 문제로 오인, Render 외부 URL로 잠시
+            #        우회했으나 FTP_HOST 오류만 고치니 FTP 자체는 정상 동작함이 확인됨
+            #   5차: /web/product/big/{yyyymm}/(카페24 자체 관리 폴더)에 업로드 시도 ->
+            #        FTP 자체에서 550 Permission denied (API 호출 전에 실패)
             # -> 최상위 "requests" 배열, 각 항목의 단일 필드명 "image"는 실제 에러로 확정.
-            # 값은 카페24 자사 FTP 서버의 "도메인 없는 상대경로"를 사용한다.
+            # 값은 카페24 자사 FTP 서버의 "도메인 없는 상대경로"를 사용하며, 이번엔 올바른
+            # 호스트로 올바른(공식 확인된) 폴더에 업로드한 뒤 재시도한다.
             image_upload_url = f"{CAFE24_API_BASE}/products/images"
             image_upload_body = {
                 "shop_no": 1,

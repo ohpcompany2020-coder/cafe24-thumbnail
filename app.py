@@ -604,10 +604,17 @@ def send_to_cafe24():
             # 이미지 1장을 등록하면 쇼핑몰의 "이미지 사이즈 설정"에 따라 tiny/small/
             # list/detail/big을 서버에서 직접 재생성하는 전용 리소스
             # (POST /products/images, "Products images")를 제공하므로 이걸 사용한다.
+            #
+            # 최상위 파라미터 이름은 실제 카페24 응답의 422 에러로 확정됨:
+            #   {"error": {"code": 422, "message": "[Product image] is a required
+            #   field. (parameter.image[0])"}}
+            # -> "requests"가 아니라 "image" 배열이어야 한다. 배열 내부 객체의
+            # 필드명(request_url)은 공식 문서에서 표까지 확정하지 못해 기존 추정을
+            # 유지 - 틀렸다면 카페24가 동일한 방식으로 다음 필드명을 에러로 알려줄 것.
             image_upload_url = f"{CAFE24_API_BASE}/products/images"
             image_upload_body = {
                 "shop_no": 1,
-                "requests": [
+                "image": [
                     {"product_no": int(p_no), "request_url": ftp_main_url}
                 ]
             }

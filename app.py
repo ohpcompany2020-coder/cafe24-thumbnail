@@ -636,10 +636,11 @@ def send_to_cafe24():
 
             # 2. 대표 이미지 갱신: detail_image/list_image/tiny_image 등은 상품 PUT의
             # "쓰기 가능한" 파라미터가 아니라 읽기 전용 응답 속성이다 (카페24가 200을
-            # 반환해도 실제로는 무시함 - list_image가 안 바뀌던 원인). 카페24는 원본
-            # 이미지 1장을 등록하면 쇼핑몰의 "이미지 사이즈 설정"에 따라 tiny/small/
-            # list/detail/big을 서버에서 직접 재생성하는 전용 리소스
-            # (POST /products/images, "Products images")를 제공하므로 이걸 사용한다.
+            # 반환해도 실제로는 무시함 - list_image가 안 바뀌던 원인). 카페24 관리자
+            # 설정의 이미지 등록 방식이 "대표이미지등록"(원본 이미지 1장만 올리면
+            # list/tiny/small을 카페24가 자동 리사이징)으로 확인되었으므로, 아래 요청은
+            # 의도적으로 "image" 필드 단 하나만 보낸다 - list_image 등을 개별 지정하지
+            # 않는다 (전용 리소스: POST /products/images, "Products images").
             #
             # 스키마/값 형식 확인 이력:
             #   1차: {"shop_no":1,"requests":[{"product_no":..,"request_url":..}]}
@@ -650,8 +651,9 @@ def send_to_cafe24():
             #        -> 422 "[Upload Image] Wrong image path" (상대경로/https로 바꿔도 동일)
             #   4차: FTP 업로드 폴더를 /web/product/big/{yyyymm}/로 바꿔 재시도하려 했으나
             #        FTP 계정 자체가 pwd()도 거부 -> FTP 완전 우회로 전환
-            # 카페24 자사 도메인이 아닌 완전 외부 HTTPS URL(Render)을 그대로 image 값으로
-            # 전달하는 이번 시도가 성공하는지는 공식 문서로 확정하지 못해 실제 응답으로 확인.
+            # -> 최상위 "requests" 배열, 각 항목의 단일 필드명 "image"까지는 실제 에러로
+            # 확정됨. 카페24 자사 도메인이 아닌 완전 외부 HTTPS URL(Render)을 그대로
+            # image 값으로 전달하는 이번 시도가 성공하는지는 실제 응답으로 확인한다.
             image_upload_url = f"{CAFE24_API_BASE}/products/images"
             image_upload_body = {
                 "shop_no": 1,

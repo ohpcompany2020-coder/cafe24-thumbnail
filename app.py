@@ -67,7 +67,10 @@ CAFE24_OAUTH_SCOPE = os.getenv("CAFE24_OAUTH_SCOPE", "mall.read_product,mall.wri
 # 재인증 URL을 직접 고정하고 싶을 때 사용 (선택, 미설정 시 위 정보로 자동 생성)
 CAFE24_REAUTH_URL = os.getenv("CAFE24_REAUTH_URL", "")
 
-FTP_HOST = os.getenv("FTP_HOST", f"{CAFE24_MALL_ID}.cafe24.com")
+# 실제 FileZilla 접속 테스트로 확인된 FTP 서버 주소는 "{mall_id}.ftp.cafe24.com"이다.
+# 기존 기본값 "{mall_id}.cafe24.com"은 ".ftp." 없이 웹 도메인과 같아서 잘못된 서버로
+# 붙었을 가능성이 높다 (계정/코드 로직 문제가 아니라 호스트 자체가 틀렸던 것).
+FTP_HOST = os.getenv("FTP_HOST", f"{CAFE24_MALL_ID}.ftp.cafe24.com")
 FTP_USER = os.getenv("FTP_USER", "your_ftp_id")
 FTP_PASS = os.getenv("FTP_PASS", "your_ftp_password")
 FTP_PORT = int(os.getenv("FTP_PORT", 21))
@@ -372,8 +375,11 @@ def _ftp_ensure_dir(ftp, remote_dir):
 def upload_to_ftp(local_file_path, remote_filename, remote_dir='/web/upload/thumbnail/'):
     """Web FTP 업로드 함수. remote_dir 하위(없으면 생성)에 파일을 올리고 접근 가능한 URL을 반환한다."""
     try:
+        logger.info(f"[FTP 접속 시도] host={FTP_HOST} port={FTP_PORT} user={FTP_USER}")
         ftp = ftplib.FTP()
         ftp.connect(FTP_HOST, FTP_PORT, timeout=30)
+        logger.info(f"[FTP 접속] 서버 환영 메시지: {ftp.getwelcome()}")
+
         ftp.login(FTP_USER, FTP_PASS)
 
         initial_dir = ftp.pwd()
@@ -387,6 +393,43 @@ def upload_to_ftp(local_file_path, remote_filename, remote_dir='/web/upload/thum
         return f"{FTP_HOST_URL}{remote_dir}{remote_filename}"
     except Exception as e:
         raise Exception(f"FTP 업로드 실패: {str(e)}")
+
+@app.route('/api/debug/ftp-test', methods=['GET'])
+def debug_ftp_test():
+    """FTP 접속 문제를 실제 업로드/변환 흐름 없이 바로 진단하기 위한 최소 테스트 엔드포인트.
+    connect -> login -> getwelcome -> pwd -> nlst를 단계별로 실행하고, 어느 단계에서
+    무슨 에러가 나는지 그대로 응답/로그에 남긴다."""
+    steps = {}
+    ftp = None
+    try:
+        steps['host'] = FTP_HOST
+        steps['port'] = FTP_PORT
+        steps['user'] = FTP_USER
+
+        ftp = ftplib.FTP()
+        ftp.connect(FTP_HOST, FTP_PORT, timeout=30)
+        steps['connect'] = 'OK'
+
+        steps['welcome'] = ftp.getwelcome()
+
+        ftp.login(FTP_USER, FTP_PASS)
+        steps['login'] = 'OK'
+
+        steps['pwd'] = ftp.pwd()
+        steps['nlst'] = ftp.nlst()
+
+        logger.info(f"[FTP 진단] {steps}")
+        return jsonify({"success": True, "steps": steps})
+    except Exception as e:
+        steps['error'] = f"{type(e).__name__}: {e}"
+        logger.error(f"[FTP 진단 실패] {steps}")
+        return jsonify({"success": False, "steps": steps}), 500
+    finally:
+        if ftp is not None:
+            try:
+                ftp.quit()
+            except Exception:
+                pass
 
 # ==========================================
 # API Endpoints

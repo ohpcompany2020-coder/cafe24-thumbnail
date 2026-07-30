@@ -1,12 +1,13 @@
 import os
 import io
+import time
 import html
 import base64
 import logging
 import threading
 import ftplib
 import requests
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlencode
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, render_template, send_from_directory
 from werkzeug.exceptions import HTTPException
@@ -227,40 +228,79 @@ IMAGE_DOWNLOAD_USER_AGENT = (
     '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 )
 
+# onehundredpercent.co.kr(대표도메인)과 newohpcompany.cafe24.com(카페24 기본도메인)은
+# 둘 다 같은 우리 쇼핑몰 서버를 가리킨다. 이 서버가 스크립트성 요청(Referer 없음/불일치)을
+# 차단하는 것으로 보여, 두 도메인을 Referer 후보로 순서대로 시도한다.
+SHOP_REFERER_CANDIDATES = [
+    os.getenv('SHOP_PRIMARY_DOMAIN', 'https://onehundredpercent.co.kr/'),
+    os.getenv('SHOP_CAFE24_DOMAIN', 'https://newohpcompany.cafe24.com/'),
+]
+
+# 업로드 직후 자체 검증(진단용) 단계를 끄고 싶을 때 환경변수로 비활성화 가능
+VERIFY_UPLOADED_IMAGE = os.getenv('VERIFY_UPLOADED_IMAGE', 'true').lower() == 'true'
+
 def fetch_image(url, timeout=10):
     """상품 이미지 다운로드.
 
-    일부 이미지 서버(예: onehundredpercent.co.kr)는 핫링크 방지 정책으로
-    Referer/User-Agent가 없는 요청을 403으로 차단하므로, 브라우저 요청처럼
-    보이도록 헤더를 채우고 Referer는 요청 대상 도메인 자기 자신으로 설정한다.
+    우리 쇼핑몰 이미지 서버(onehundredpercent.co.kr / newohpcompany.cafe24.com)가
+    Referer/User-Agent가 없는 스크립트성 요청을 403으로 차단하는 것으로 확인되어,
+    브라우저 요청처럼 보이도록 헤더를 채우고 Referer는 쇼핑몰 대표도메인으로 고정 시도한다.
+    403이 나면 다음 후보 도메인(카페24 기본도메인)으로 재시도한다.
     """
-    parsed = urlparse(url)
-    headers = {
-        'User-Agent': IMAGE_DOWNLOAD_USER_AGENT,
-        'Referer': f"{parsed.scheme}://{parsed.netloc}/"
-    }
-    resp = requests.get(url, headers=headers, timeout=timeout)
-    resp.raise_for_status()
-    return resp
+    last_error = None
+    for referer in SHOP_REFERER_CANDIDATES:
+        headers = {
+            'User-Agent': IMAGE_DOWNLOAD_USER_AGENT,
+            'Referer': referer
+        }
+        resp = requests.get(url, headers=headers, timeout=timeout)
+        if resp.status_code == 403:
+            logger.warning(f"[이미지 다운로드 403] url={url} referer={referer} - 다음 후보로 재시도")
+            last_error = resp
+            continue
+        resp.raise_for_status()
+        return resp
 
-def verify_image_dimensions(product_no, field_name, image_url, expected_ratio=1.4, tolerance=0.02):
+    # 모든 후보 Referer에서 403이 발생한 경우 마지막 응답으로 에러를 표면화
+    last_error.raise_for_status()
+
+def verify_image_dimensions(product_no, field_name, image_url, expected_ratio=1.4, tolerance=0.02, retry_delay=3):
     """카페24가 실제로 반영한 이미지 URL을 다시 받아 PIL로 실제 크기/비율을 로그로 남긴다.
     CDN 캐시로 예전 이미지가 그대로 보이는 경우와, 애초에 잘못된 필드/이미지가
-    올라간 경우를 구분하기 위한 진단용 로그."""
-    try:
-        resp = requests.get(image_url, timeout=10)
-        resp.raise_for_status()
-        with Image.open(io.BytesIO(resp.content)) as img:
-            w, h = img.size
-        ratio = (h / w) if w else 0
-        ok = abs(ratio - expected_ratio) <= tolerance
-        logger.info(
-            f"[크기 검증] product_no={product_no} field={field_name} url={image_url} "
-            f"size={w}x{h} ratio={ratio:.3f} (기대값 {expected_ratio}) "
-            f"{'OK' if ok else 'MISMATCH - 여전히 구 이미지이거나 다른 필드일 가능성'}"
-        )
-    except Exception as e:
-        logger.warning(f"[크기 검증 실패] product_no={product_no} field={field_name} url={image_url}: {e}")
+    올라간 경우를 구분하기 위한 진단용 로그일 뿐이다.
+
+    이 함수는 어떤 예외도 상위로 전파하지 않는다 - 검증 실패가 카페24 PUT 요청의
+    성공 여부(실제 송신 결과)를 뒤집어서는 안 되기 때문이다.
+    """
+    if not VERIFY_UPLOADED_IMAGE:
+        logger.info(f"[크기 검증] product_no={product_no} 검증 비활성화(VERIFY_UPLOADED_IMAGE=false) - 건너뜀")
+        return
+
+    for attempt in (1, 2):
+        try:
+            resp = fetch_image(image_url, timeout=10)
+            with Image.open(io.BytesIO(resp.content)) as img:
+                w, h = img.size
+            ratio = (h / w) if w else 0
+            ok = abs(ratio - expected_ratio) <= tolerance
+            logger.info(
+                f"[크기 검증] product_no={product_no} field={field_name} url={image_url} "
+                f"size={w}x{h} ratio={ratio:.3f} (기대값 {expected_ratio}) "
+                f"{'OK' if ok else 'MISMATCH - 여전히 구 이미지이거나 CDN 캐시일 가능성'}"
+            )
+            return
+        except Exception as e:
+            if attempt == 1:
+                logger.warning(
+                    f"[크기 검증] product_no={product_no} field={field_name} 1차 시도 실패({e}), "
+                    f"CDN 반영 시차를 감안해 {retry_delay}초 후 재시도"
+                )
+                time.sleep(retry_delay)
+            else:
+                logger.warning(
+                    f"[크기 검증 실패] product_no={product_no} field={field_name} url={image_url}: {e} "
+                    f"(이 검증은 진단 목적이며 카페24 PUT 성공/실패 판정에는 영향 없음)"
+                )
 
 def process_image_bytes(image_bytes, filename, mode='product'):
     """GIF Multi-frame / JPG / PNG 처리
@@ -594,7 +634,10 @@ def send_to_cafe24():
             logger.info(f"[업로드 URL] product_no={p_no} FTP 업로드 실제 URL: {ftp_main_url}")
 
             api_url = f"{CAFE24_API_BASE}/products/{p_no}"
-            res = cafe24_api_request('PUT', api_url, json={"request": {"images": images_payload}}, timeout=15)
+            request_body = {"request": {"images": images_payload}}
+            logger.info(f"[카페24 PUT 요청] product_no={p_no} url={api_url} payload={request_body}")
+
+            res = cafe24_api_request('PUT', api_url, json=request_body, timeout=15)
             res_json = res.json()
             logger.info(f"[카페24 응답] product_no={p_no} status={res.status_code} body={res_json}")
 

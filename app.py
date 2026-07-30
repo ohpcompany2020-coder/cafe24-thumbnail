@@ -382,8 +382,12 @@ def upload_to_ftp(local_file_path, remote_filename, remote_dir='/web/upload/thum
 
         ftp.login(FTP_USER, FTP_PASS)
 
-        initial_dir = ftp.pwd()
-        logger.info(f"[FTP 접속] 로그인 직후 기본 디렉토리(pwd): {initial_dir}")
+        # 일부 카페24 FTP 계정은 PWD 자체를 550으로 거부하지만, 이는 업로드(STOR)나
+        # 폴더 이동(CWD)과는 무관한 별개 명령이라 실패해도 무시하고 계속 진행한다.
+        try:
+            logger.info(f"[FTP 접속] 로그인 직후 기본 디렉토리(pwd): {ftp.pwd()}")
+        except Exception as pwd_err:
+            logger.warning(f"[FTP 접속] pwd() 실패(무시하고 계속 진행): {pwd_err}")
 
         _ftp_ensure_dir(ftp, remote_dir)
 
@@ -394,11 +398,23 @@ def upload_to_ftp(local_file_path, remote_filename, remote_dir='/web/upload/thum
     except Exception as e:
         raise Exception(f"FTP 업로드 실패: {str(e)}")
 
+def _ftp_debug_step(steps, name, fn):
+    """진단 단계 하나를 실행하고 성공/실패와 결과(또는 에러)를 steps 딕셔너리에 기록한다.
+    한 단계가 실패해도 예외를 던지지 않고 다음 단계로 계속 진행할 수 있게 한다."""
+    try:
+        result = fn()
+        steps[name] = {"ok": True, "result": result}
+        return True
+    except Exception as e:
+        steps[name] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        return False
+
 @app.route('/api/debug/ftp-test', methods=['GET'])
 def debug_ftp_test():
     """FTP 접속 문제를 실제 업로드/변환 흐름 없이 바로 진단하기 위한 최소 테스트 엔드포인트.
-    connect -> login -> getwelcome -> pwd -> nlst를 단계별로 실행하고, 어느 단계에서
-    무슨 에러가 나는지 그대로 응답/로그에 남긴다."""
+    connect/login까지는 필수 전제 조건으로 실패 시 즉시 중단하고, 그 이후 pwd/cwd/nlst/
+    실제 업로드(STOR)는 각각 독립적으로 시도해서 어느 단계가 성공/실패하는지 모두 남긴다
+    (PWD만 막히고 나머지는 정상 동작하는 경우를 확인하기 위함)."""
     steps = {}
     ftp = None
     try:
@@ -408,20 +424,44 @@ def debug_ftp_test():
 
         ftp = ftplib.FTP()
         ftp.connect(FTP_HOST, FTP_PORT, timeout=30)
-        steps['connect'] = 'OK'
-
+        steps['connect'] = {"ok": True}
         steps['welcome'] = ftp.getwelcome()
 
         ftp.login(FTP_USER, FTP_PASS)
-        steps['login'] = 'OK'
+        steps['login'] = {"ok": True}
 
-        steps['pwd'] = ftp.pwd()
-        steps['nlst'] = ftp.nlst()
+        _ftp_debug_step(steps, 'pwd', ftp.pwd)
+        _ftp_debug_step(steps, 'cwd_web', lambda: ftp.cwd('/web'))
+        _ftp_debug_step(steps, 'nlst_web', ftp.nlst)
+        _ftp_debug_step(steps, 'cwd_web_product', lambda: ftp.cwd('/web/product'))
+
+        # 실제 업로드(STOR) 테스트: 이미 변환된 이미지가 있으면 그중 하나를 재사용하고,
+        # 없으면 작은 더미 텍스트 파일을 만들어 업로드해본다. 어느 폴더에 있든(위 cwd
+        # 성공 여부와 무관하게 현재 위치 기준) 시도한다.
+        existing_files = [
+            f for f in os.listdir(UPLOAD_FOLDER)
+            if os.path.isfile(os.path.join(UPLOAD_FOLDER, f))
+        ]
+        if existing_files:
+            test_local_path = os.path.join(UPLOAD_FOLDER, existing_files[0])
+            test_remote_name = f"_ftp_test_{existing_files[0]}"
+        else:
+            test_local_path = os.path.join(UPLOAD_FOLDER, '_ftp_test_dummy.txt')
+            with open(test_local_path, 'wb') as f:
+                f.write(b"cafe24-thumbnail ftp connectivity test")
+            test_remote_name = '_ftp_test_dummy.txt'
+
+        def _do_stor_test():
+            with open(test_local_path, 'rb') as f:
+                ftp.storbinary(f'STOR {test_remote_name}', f)
+            return test_remote_name
+
+        _ftp_debug_step(steps, 'stor_test', _do_stor_test)
 
         logger.info(f"[FTP 진단] {steps}")
         return jsonify({"success": True, "steps": steps})
     except Exception as e:
-        steps['error'] = f"{type(e).__name__}: {e}"
+        steps['fatal_error'] = f"{type(e).__name__}: {e}"
         logger.error(f"[FTP 진단 실패] {steps}")
         return jsonify({"success": False, "steps": steps}), 500
     finally:

@@ -7,6 +7,7 @@ import logging
 import threading
 import ftplib
 import requests
+from datetime import datetime
 from urllib.parse import urlencode
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, render_template, send_from_directory
@@ -43,13 +44,6 @@ def handle_unexpected_error(e):
 UPLOAD_FOLDER = os.path.join(app.root_path, 'static', 'processed_images')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# 이 앱이 배포된(Render) 공개 주소. /static/processed_images/<filename>가 이미 이 주소로
-# HTTPS 공개 서빙되고 있으므로, FTP 없이 카페24에 바로 이 URL을 넘겨보기 위해 사용.
-APP_PUBLIC_BASE_URL = os.getenv(
-    "APP_PUBLIC_BASE_URL",
-    os.getenv("RENDER_EXTERNAL_URL", "https://cafe24-thumbnail.onrender.com")
-).rstrip('/')
-
 CAFE24_MALL_ID = os.getenv("CAFE24_MALL_ID", "your_mall_id")
 CAFE24_ACCESS_TOKEN = os.getenv("CAFE24_ACCESS_TOKEN", "your_access_token")
 CAFE24_REFRESH_TOKEN = os.getenv("CAFE24_REFRESH_TOKEN", "")
@@ -75,6 +69,13 @@ FTP_USER = os.getenv("FTP_USER", "your_ftp_id")
 FTP_PASS = os.getenv("FTP_PASS", "your_ftp_password")
 FTP_PORT = int(os.getenv("FTP_PORT", 21))
 FTP_HOST_URL = f"http://{CAFE24_MALL_ID}.cafe24.com"
+
+# FTP 연결 자체는 정상 동작이 확인됐다 (/api/debug/ftp-test: cwd/nlst/STOR 모두 성공,
+# pwd()만 이 계정에서 예외적으로 거부됨). 실제 정상 노출되는 상품 이미지들이
+# "/web/product/{사이즈}/{년월}/{파일명}" 구조를 따르므로, 대표 이미지도 이 규칙에
+# 맞춰 업로드한다.
+def product_image_upload_dir():
+    return f"/web/product/big/{datetime.now().strftime('%Y%m')}/"
 
 if "your_" in CAFE24_MALL_ID or "your_" in CAFE24_ACCESS_TOKEN:
     logger.warning("CAFE24_MALL_ID / CAFE24_ACCESS_TOKEN이 기본값입니다. .env에 실제 운영 값을 설정해 주세요.")
@@ -710,12 +711,17 @@ def send_to_cafe24():
         local_path = os.path.join(UPLOAD_FOLDER, filename)
 
         try:
-            # 1. 대표 썸네일: FTP 계정이 pwd()조차 "Permission denied"로 거부해서
-            # (계정 권한 문제로 코드로는 해결 불가) FTP 업로드를 완전히 건너뛴다.
-            # 이 앱이 이미 /static/processed_images/<filename>를 공개 HTTPS로 서빙하고
-            # 있으므로 그 공개 URL을 그대로 카페24에 전달해본다.
-            public_image_url = f"{APP_PUBLIC_BASE_URL}/static/processed_images/{filename}"
-            logger.info(f"[공개 URL] product_no={p_no} 카페24에 전달할 공개 URL: {public_image_url}")
+            # 1. 대표 썸네일 FTP 업로드. FTP는 정상 동작이 확인됐다
+            # (/api/debug/ftp-test: cwd/nlst/STOR 전부 성공, pwd()만 이 계정에서
+            # 예외적으로 거부됨 - upload_to_ftp도 pwd 실패를 무시하고 진행함).
+            # 실제 정상 노출 이미지들과 같은 "/web/product/{사이즈}/{년월}/" 구조로 올린다.
+            remote_dir = product_image_upload_dir()
+            ftp_main_url = upload_to_ftp(local_path, filename, remote_dir=remote_dir)
+            relative_image_path = f"{remote_dir}{filename}"
+            logger.info(
+                f"[업로드 URL] product_no={p_no} FTP 업로드 URL={ftp_main_url} "
+                f"상대경로={relative_image_path}"
+            )
 
             # 2. 대표 이미지 갱신: detail_image/list_image/tiny_image 등은 상품 PUT의
             # "쓰기 가능한" 파라미터가 아니라 읽기 전용 응답 속성이다 (카페24가 200을
@@ -731,17 +737,18 @@ def send_to_cafe24():
             #   2차: {"shop_no":1,"image":[{"product_no":..,"request_url":..}]}
             #        -> 422 "Please enter the Requests parameter."
             #   3차: {"shop_no":1,"requests":[{"product_no":..,"image":"http://newohpcompany.../web/upload/..."}]}
-            #        -> 422 "[Upload Image] Wrong image path" (상대경로/https로 바꿔도 동일)
-            #   4차: FTP 업로드 폴더를 /web/product/big/{yyyymm}/로 바꿔 재시도하려 했으나
-            #        FTP 계정 자체가 pwd()도 거부 -> FTP 완전 우회로 전환
-            # -> 최상위 "requests" 배열, 각 항목의 단일 필드명 "image"까지는 실제 에러로
-            # 확정됨. 카페24 자사 도메인이 아닌 완전 외부 HTTPS URL(Render)을 그대로
-            # image 값으로 전달하는 이번 시도가 성공하는지는 실제 응답으로 확인한다.
+            #        -> 422 "[Upload Image] Wrong image path" (상대경로/https로 바꿔도 동일 -
+            #        당시엔 FTP 폴더가 /web/upload/thumbnail/라 실제 상품 이미지 경로 구조와 달랐음)
+            #   4차: FTP 계정이 pwd()로 거부당해 계정 문제로 오인, 잠시 Render가 서빙하는
+            #        외부 HTTPS URL로 우회를 시도했으나(성공/실패 미검증) FTP 자체가
+            #        FTP_HOST 설정 오류(".ftp." 누락)였을 뿐 정상 동작함이 확인되어 폐기
+            # -> 최상위 "requests" 배열, 각 항목의 단일 필드명 "image"는 실제 에러로 확정.
+            # 값은 카페24 자사 FTP 서버의 "도메인 없는 상대경로"를 사용한다.
             image_upload_url = f"{CAFE24_API_BASE}/products/images"
             image_upload_body = {
                 "shop_no": 1,
                 "requests": [
-                    {"product_no": int(p_no), "image": public_image_url}
+                    {"product_no": int(p_no), "image": relative_image_path}
                 ]
             }
             logger.info(f"[카페24 이미지 등록 요청] product_no={p_no} url={image_upload_url} payload={image_upload_body}")
@@ -787,7 +794,7 @@ def send_to_cafe24():
             logger.info(f"[카페24 응답] product_no={p_no} status={res.status_code} body={res_json}")
 
             if res.status_code == 200:
-                success_list.append({"product_no": p_no, "url": public_image_url})
+                success_list.append({"product_no": p_no, "url": ftp_main_url})
 
                 # 실제로 반영된 list_image를 카페24에 직접 재조회해서 검증한다.
                 # (이미지 등록 API 응답의 필드명을 확신할 수 없으므로, 항상 정확한

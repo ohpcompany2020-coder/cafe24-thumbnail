@@ -732,10 +732,12 @@ def send_to_cafe24():
             # 폴더이므로 대표 이미지도 이 폴더(upload_to_ftp 기본값)를 그대로 쓴다.
             remote_dir = '/web/upload/thumbnail/'
             ftp_main_url = upload_to_ftp(local_path, filename, remote_dir=remote_dir)
-            relative_image_path = f"{remote_dir}{filename}"
+            # 카페24 챗봇 공식 답변: image 파라미터는 상대경로가 아니라 "https://" 절대
+            # URL(도메인 포함)이어야 한다. (예전에 http://로 시도했을 때는 실패)
+            https_image_url = f"https://{CAFE24_MALL_ID}.cafe24.com{remote_dir}{filename}"
             logger.info(
                 f"[업로드 URL] product_no={p_no} FTP 업로드 URL={ftp_main_url} "
-                f"상대경로={relative_image_path}"
+                f"카페24 전달용 https 절대URL={https_image_url}"
             )
 
             # 2. 대표 이미지 갱신: detail_image/list_image/tiny_image 등은 상품 PUT의
@@ -759,14 +761,17 @@ def send_to_cafe24():
             #        우회했으나 FTP_HOST 오류만 고치니 FTP 자체는 정상 동작함이 확인됨
             #   5차: /web/product/big/{yyyymm}/(카페24 자체 관리 폴더)에 업로드 시도 ->
             #        FTP 자체에서 550 Permission denied (API 호출 전에 실패)
+            #   6차: 올바른 폴더(/web/upload/thumbnail/)의 "상대경로"로 시도 예정이었으나,
+            #        카페24 챗봇 공식 답변으로 image는 상대경로가 아니라 "https://" 절대
+            #        URL(도메인 포함)이어야 한다고 확인됨 (http://는 예전에 실패했었음)
             # -> 최상위 "requests" 배열, 각 항목의 단일 필드명 "image"는 실제 에러로 확정.
-            # 값은 카페24 자사 FTP 서버의 "도메인 없는 상대경로"를 사용하며, 이번엔 올바른
-            # 호스트로 올바른(공식 확인된) 폴더에 업로드한 뒤 재시도한다.
+            # 값은 "https://{mall_id}.cafe24.com/web/upload/thumbnail/{파일명}" 형태의
+            # https 절대 URL을 사용한다.
             image_upload_url = f"{CAFE24_API_BASE}/products/images"
             image_upload_body = {
                 "shop_no": 1,
                 "requests": [
-                    {"product_no": int(p_no), "image": relative_image_path}
+                    {"product_no": int(p_no), "image": https_image_url}
                 ]
             }
             logger.info(f"[카페24 이미지 등록 요청] product_no={p_no} url={image_upload_url} payload={image_upload_body}")

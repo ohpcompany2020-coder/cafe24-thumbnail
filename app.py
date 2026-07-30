@@ -354,14 +354,20 @@ def process_image_bytes(image_bytes, filename, mode='product'):
     return output_filename
 
 def _ftp_ensure_dir(ftp, remote_dir):
-    """remote_dir(예: '/web/product/big/202607/')이 없으면 한 단계씩 생성하며 이동한다."""
-    ftp.cwd('/')
+    """remote_dir(예: '/web/product/big/202607/')이 없으면 한 단계씩 생성하며 이동한다.
+    일부 카페24 FTP 계정은 접속 시 특정 폴더에 chroot되어 있어 cwd('/')(루트만 단독
+    지정)를 거부한다 (550 /: No such file or directory). 따라서 루트로 먼저 이동하지
+    않고, 매 단계마다 remote_dir의 절대경로 전체(예: '/web', '/web/product', ...)를
+    그대로 cwd에 전달한다 - 기존에 '/web/upload/thumbnail/' 같은 절대경로 1회 cwd가
+    실제로 성공했던 것과 동일한 방식."""
+    path_so_far = ''
     for part in remote_dir.strip('/').split('/'):
+        path_so_far += '/' + part
         try:
-            ftp.cwd(part)
+            ftp.cwd(path_so_far)
         except ftplib.error_perm:
-            ftp.mkd(part)
-            ftp.cwd(part)
+            ftp.mkd(path_so_far)
+            ftp.cwd(path_so_far)
 
 def upload_to_ftp(local_file_path, remote_filename, remote_dir='/web/upload/thumbnail/'):
     """Web FTP 업로드 함수. remote_dir 하위(없으면 생성)에 파일을 올리고 접근 가능한 URL을 반환한다."""
@@ -369,6 +375,9 @@ def upload_to_ftp(local_file_path, remote_filename, remote_dir='/web/upload/thum
         ftp = ftplib.FTP()
         ftp.connect(FTP_HOST, FTP_PORT, timeout=30)
         ftp.login(FTP_USER, FTP_PASS)
+
+        initial_dir = ftp.pwd()
+        logger.info(f"[FTP 접속] 로그인 직후 기본 디렉토리(pwd): {initial_dir}")
 
         _ftp_ensure_dir(ftp, remote_dir)
 

@@ -7,7 +7,7 @@ import logging
 import threading
 import ftplib
 import requests
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, render_template, send_from_directory
 from werkzeug.exceptions import HTTPException
@@ -163,6 +163,17 @@ def cafe24_api_request(method, url, **kwargs):
         res = requests.request(method, url, headers=cafe24_headers(), **kwargs)
 
     return res
+
+def extract_cafe24_error_message(res_json, default='API 호출 실패'):
+    """카페24 에러 응답은 엔드포인트에 따라 {"error": {...}} 단수 형태와
+    {"errors": [{...}, ...]} 복수 형태가 섞여 있어 둘 다 처리한다."""
+    error = res_json.get('error')
+    if isinstance(error, dict):
+        return error.get('message', default)
+    errors = res_json.get('errors')
+    if isinstance(errors, list) and errors and isinstance(errors[0], dict):
+        return errors[0].get('message', default)
+    return default
 
 # ==========================================
 # 1:1 -> 1:1.4 (1000x1400) 가공 로직
@@ -605,31 +616,52 @@ def send_to_cafe24():
             # list/detail/big을 서버에서 직접 재생성하는 전용 리소스
             # (POST /products/images, "Products images")를 제공하므로 이걸 사용한다.
             #
-            # 정확한 스키마는 실제 카페24 응답의 두 에러를 대조해서 확정함:
+            # 스키마는 실제 카페24 응답의 에러들을 대조해서 확정함:
             #   1차: {"shop_no":1,"requests":[{"product_no":..,"request_url":..}]}
             #        -> 422 "[Product image] is a required field. (parameter.image[0])"
             #   2차: {"shop_no":1,"image":[{"product_no":..,"request_url":..}]}
             #        -> 422 "Please enter the Requests parameter."
-            # 2차 에러로 최상위 키는 "requests"가 맞다는 게 확정되고, 1차 에러의
-            # "parameter.image[0]"은 "requests[0]에 image 필드가 없다"는 뜻이었던 것으로
-            # 해석됨 -> 배열 내부 필드명은 request_url이 아니라 "image".
-            image_upload_url = f"{CAFE24_API_BASE}/products/images"
-            image_upload_body = {
-                "shop_no": 1,
-                "requests": [
-                    {"product_no": int(p_no), "image": ftp_main_url}
-                ]
-            }
-            logger.info(f"[카페24 이미지 등록 요청] product_no={p_no} url={image_upload_url} payload={image_upload_body}")
+            #   3차: {"shop_no":1,"requests":[{"product_no":..,"image":"http://전체URL"}]}
+            #        -> 422 "[Upload Image] Wrong image path" (전체 URL 자체가 잘못됐다는 뜻)
+            # -> 최상위 키 "requests", 내부 필드명 "image"까지는 확정. 값 형식만 남았으므로
+            # FTP 저장 경로 기준 "도메인 없는 상대경로" -> 안 되면 "https 전체 URL" 순으로 시도.
+            parsed_ftp_url = urlparse(ftp_main_url)
+            relative_image_path = parsed_ftp_url.path
+            https_image_url = f"https://{parsed_ftp_url.netloc}{parsed_ftp_url.path}"
+            image_value_candidates = [relative_image_path, https_image_url]
 
-            img_res = cafe24_api_request('POST', image_upload_url, json=image_upload_body, timeout=15)
-            img_res_json = img_res.json()
-            logger.info(f"[카페24 이미지 등록 응답] product_no={p_no} status={img_res.status_code} body={img_res_json}")
+            logger.info(
+                f"[FTP 경로 확인] product_no={p_no} FTP 저장 상대경로={relative_image_path} "
+                f"(upload_to_ftp가 반환한 원본 URL과 동일 호스트/경로에서 파생됨: {ftp_main_url})"
+            )
+
+            image_upload_url = f"{CAFE24_API_BASE}/products/images"
+            img_res = None
+            img_res_json = None
+            img_err_msg = None
+
+            for candidate in image_value_candidates:
+                image_upload_body = {
+                    "shop_no": 1,
+                    "requests": [
+                        {"product_no": int(p_no), "image": candidate}
+                    ]
+                }
+                logger.info(f"[카페24 이미지 등록 요청] product_no={p_no} url={image_upload_url} payload={image_upload_body}")
+
+                img_res = cafe24_api_request('POST', image_upload_url, json=image_upload_body, timeout=15)
+                img_res_json = img_res.json()
+                logger.info(f"[카페24 이미지 등록 응답] product_no={p_no} status={img_res.status_code} body={img_res_json}")
+
+                if img_res.status_code in (200, 201):
+                    break
+
+                img_err_msg = extract_cafe24_error_message(img_res_json, '이미지 등록 API 호출 실패')
+                logger.warning(f"[카페24 이미지 등록 실패] product_no={p_no} candidate={candidate} reason={img_err_msg} - 다음 후보로 재시도")
 
             if img_res.status_code not in (200, 201):
-                err_msg = img_res_json.get('error', {}).get('message', '이미지 등록 API 호출 실패')
-                logger.error(f"카페24 이미지 등록 실패 (product_no={p_no}): {err_msg}")
-                fail_list.append({"product_no": p_no, "reason": err_msg})
+                logger.error(f"카페24 이미지 등록 실패 (product_no={p_no}): {img_err_msg}")
+                fail_list.append({"product_no": p_no, "reason": img_err_msg})
                 continue
 
             # 3. 추가이미지 제어 조건 (기존 상품 PUT 그대로 유지 - add_image는 별도 필드)
@@ -681,7 +713,7 @@ def send_to_cafe24():
                 except Exception as verify_err:
                     logger.warning(f"[list_image 재조회 실패] product_no={p_no}: {verify_err}")
             else:
-                err_msg = res_json.get('error', {}).get('message', 'API 호출 실패')
+                err_msg = extract_cafe24_error_message(res_json)
                 logger.error(f"카페24 송신 실패 (product_no={p_no}): {err_msg}")
                 fail_list.append({"product_no": p_no, "reason": err_msg})
 

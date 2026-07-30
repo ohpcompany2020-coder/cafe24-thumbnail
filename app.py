@@ -6,7 +6,7 @@ import logging
 import threading
 import ftplib
 import requests
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, render_template, send_from_directory
 from werkzeug.exceptions import HTTPException
@@ -221,6 +221,27 @@ def crop_to_1400_ratio(img, target_w=1000, target_h=1400):
         cropped = cropped.resize((target_w, target_h), Image.Resampling.LANCZOS)
 
     return cropped.convert('RGB')
+
+IMAGE_DOWNLOAD_USER_AGENT = (
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+)
+
+def fetch_image(url, timeout=10):
+    """상품 이미지 다운로드.
+
+    일부 이미지 서버(예: onehundredpercent.co.kr)는 핫링크 방지 정책으로
+    Referer/User-Agent가 없는 요청을 403으로 차단하므로, 브라우저 요청처럼
+    보이도록 헤더를 채우고 Referer는 요청 대상 도메인 자기 자신으로 설정한다.
+    """
+    parsed = urlparse(url)
+    headers = {
+        'User-Agent': IMAGE_DOWNLOAD_USER_AGENT,
+        'Referer': f"{parsed.scheme}://{parsed.netloc}/"
+    }
+    resp = requests.get(url, headers=headers, timeout=timeout)
+    resp.raise_for_status()
+    return resp
 
 def process_image_bytes(image_bytes, filename, mode='product'):
     """GIF Multi-frame / JPG / PNG 처리
@@ -468,8 +489,7 @@ def convert_thumbnails():
         filename = item.get('filename', f"{p_no}.jpg")
 
         try:
-            resp = requests.get(img_url, timeout=10)
-            resp.raise_for_status()
+            resp = fetch_image(img_url, timeout=10)
 
             output_file = process_image_bytes(resp.content, filename, mode)
             preview_url = f"/static/processed_images/{output_file}"
@@ -533,8 +553,7 @@ def send_to_cafe24():
                 processed_add_urls = []
 
                 for idx, add_url in enumerate(raw_add_images):
-                    add_resp = requests.get(add_url, timeout=10)
-                    add_resp.raise_for_status()
+                    add_resp = fetch_image(add_url, timeout=10)
 
                     add_filename = f"{p_no}_add_{idx}.jpg"
                     out_add_file = process_image_bytes(add_resp.content, add_filename, 'product')

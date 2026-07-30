@@ -363,20 +363,34 @@ def _ftp_ensure_dir(ftp, remote_dir):
     지정)를 거부한다 (550 /: No such file or directory). 따라서 루트로 먼저 이동하지
     않고, 매 단계마다 remote_dir의 절대경로 전체(예: '/web', '/web/product', ...)를
     그대로 cwd에 전달한다 - 기존에 '/web/upload/thumbnail/' 같은 절대경로 1회 cwd가
-    실제로 성공했던 것과 동일한 방식."""
+    실제로 성공했던 것과 동일한 방식.
+
+    각 단계(CWD 성공/실패, MKD 필요 여부)를 전부 로그로 남겨 실제 어느 폴더까지
+    도달했는지 추적 가능하게 한다."""
     path_so_far = ''
     for part in remote_dir.strip('/').split('/'):
         path_so_far += '/' + part
         try:
             ftp.cwd(path_so_far)
-        except ftplib.error_perm:
-            ftp.mkd(path_so_far)
+            logger.info(f"[FTP CWD] '{path_so_far}' 이동 성공 (기존 폴더)")
+        except ftplib.error_perm as e:
+            logger.warning(f"[FTP CWD] '{path_so_far}' 이동 실패({e}) - MKD 시도")
+            try:
+                ftp.mkd(path_so_far)
+                logger.info(f"[FTP MKD] '{path_so_far}' 생성 성공")
+            except ftplib.error_perm as mkd_err:
+                logger.error(f"[FTP MKD] '{path_so_far}' 생성 실패: {mkd_err}")
+                raise
             ftp.cwd(path_so_far)
+            logger.info(f"[FTP CWD] '{path_so_far}' 생성 후 이동 성공")
 
 def upload_to_ftp(local_file_path, remote_filename, remote_dir='/web/upload/thumbnail/'):
     """Web FTP 업로드 함수. remote_dir 하위(없으면 생성)에 파일을 올리고 접근 가능한 URL을 반환한다."""
     try:
-        logger.info(f"[FTP 접속 시도] host={FTP_HOST} port={FTP_PORT} user={FTP_USER}")
+        logger.info(
+            f"[FTP 접속 시도] host={FTP_HOST} port={FTP_PORT} user={FTP_USER} "
+            f"remote_dir={remote_dir} remote_filename={remote_filename}"
+        )
         ftp = ftplib.FTP()
         ftp.connect(FTP_HOST, FTP_PORT, timeout=30)
         logger.info(f"[FTP 접속] 서버 환영 메시지: {ftp.getwelcome()}")
@@ -392,11 +406,14 @@ def upload_to_ftp(local_file_path, remote_filename, remote_dir='/web/upload/thum
 
         _ftp_ensure_dir(ftp, remote_dir)
 
+        logger.info(f"[FTP STOR 시도] '{remote_dir}' 폴더에서 '{remote_filename}' 업로드 시작")
         with open(local_file_path, 'rb') as f:
             ftp.storbinary(f'STOR {remote_filename}', f)
+        logger.info(f"[FTP STOR 성공] '{remote_dir}{remote_filename}'")
         ftp.quit()
         return f"{FTP_HOST_URL}{remote_dir}{remote_filename}"
     except Exception as e:
+        logger.error(f"[FTP 업로드 실패] remote_dir={remote_dir} remote_filename={remote_filename}: {e}")
         raise Exception(f"FTP 업로드 실패: {str(e)}")
 
 def _ftp_debug_step(steps, name, fn):

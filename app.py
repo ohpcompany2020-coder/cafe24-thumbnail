@@ -605,17 +605,19 @@ def send_to_cafe24():
             # list/detail/big을 서버에서 직접 재생성하는 전용 리소스
             # (POST /products/images, "Products images")를 제공하므로 이걸 사용한다.
             #
-            # 최상위 파라미터 이름은 실제 카페24 응답의 422 에러로 확정됨:
-            #   {"error": {"code": 422, "message": "[Product image] is a required
-            #   field. (parameter.image[0])"}}
-            # -> "requests"가 아니라 "image" 배열이어야 한다. 배열 내부 객체의
-            # 필드명(request_url)은 공식 문서에서 표까지 확정하지 못해 기존 추정을
-            # 유지 - 틀렸다면 카페24가 동일한 방식으로 다음 필드명을 에러로 알려줄 것.
+            # 정확한 스키마는 실제 카페24 응답의 두 에러를 대조해서 확정함:
+            #   1차: {"shop_no":1,"requests":[{"product_no":..,"request_url":..}]}
+            #        -> 422 "[Product image] is a required field. (parameter.image[0])"
+            #   2차: {"shop_no":1,"image":[{"product_no":..,"request_url":..}]}
+            #        -> 422 "Please enter the Requests parameter."
+            # 2차 에러로 최상위 키는 "requests"가 맞다는 게 확정되고, 1차 에러의
+            # "parameter.image[0]"은 "requests[0]에 image 필드가 없다"는 뜻이었던 것으로
+            # 해석됨 -> 배열 내부 필드명은 request_url이 아니라 "image".
             image_upload_url = f"{CAFE24_API_BASE}/products/images"
             image_upload_body = {
                 "shop_no": 1,
-                "image": [
-                    {"product_no": int(p_no), "request_url": ftp_main_url}
+                "requests": [
+                    {"product_no": int(p_no), "image": ftp_main_url}
                 ]
             }
             logger.info(f"[카페24 이미지 등록 요청] product_no={p_no} url={image_upload_url} payload={image_upload_body}")

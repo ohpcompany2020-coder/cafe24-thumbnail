@@ -486,6 +486,249 @@ def debug_ftp_test():
                 pass
 
 # ==========================================
+# [진단] products/images "image" 파라미터 형식 일괄 테스트
+# ==========================================
+# 대표도메인(자체 도메인). 카페24 기본도메인은 f"{CAFE24_MALL_ID}.cafe24.com"으로 계산한다.
+SHOP_PRIMARY_HOST = os.getenv('SHOP_PRIMARY_HOST', 'onehundredpercent.co.kr')
+# 카페24 안내상 "외부에서 업로드한 상품 이미지"가 요구될 수 있다는 폴더
+CAFE24_EXTRA_IMAGE_DIR = '/web/product/extra/excel/'
+
+
+def _preview_image_value(value, limit=50):
+    """로그/응답에 남길 image 값 미리보기. base64 data URI처럼 긴 값은 앞 50자만 남긴다."""
+    if not isinstance(value, str):
+        return value
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit]}...(총 {len(value)}자)"
+
+
+def _register_image_attempt(product_no, label, description, image_value):
+    """POST /admin/products/images 를 image 값 후보 하나로 호출하고 결과를 dict로 반환한다.
+    실패해도 예외를 던지지 않는다 (다음 후보를 계속 시도해야 하므로)."""
+    api_url = f"{CAFE24_API_BASE}/products/images"
+    body = {"shop_no": 1, "requests": [{"product_no": int(product_no), "image": image_value}]}
+    log_payload = {
+        "shop_no": 1,
+        "requests": [{"product_no": int(product_no), "image": _preview_image_value(image_value)}]
+    }
+
+    attempt = {
+        "candidate": label,
+        "description": description,
+        "image_preview": _preview_image_value(image_value),
+        "image_length": len(image_value) if isinstance(image_value, str) else None,
+        "request_payload": log_payload,
+    }
+
+    logger.info(f"[이미지등록 진단 요청] #{label} ({description}) url={api_url} payload={log_payload}")
+
+    try:
+        res = cafe24_api_request('POST', api_url, json=body, timeout=20)
+    except Cafe24ReauthRequired as e:
+        attempt.update({"ok": False, "error": f"카페24 재인증 필요: {e}", "reauth_required": True})
+        logger.error(f"[이미지등록 진단 응답] #{label} 재인증 필요: {e}")
+        return attempt
+    except Exception as e:
+        attempt.update({"ok": False, "error": f"{type(e).__name__}: {e}"})
+        logger.error(f"[이미지등록 진단 응답] #{label} 요청 예외: {type(e).__name__}: {e}")
+        return attempt
+
+    try:
+        res_json = res.json()
+    except ValueError:
+        res_json = {"raw_text": res.text}
+
+    # requests의 headers는 대소문자 구분이 없으므로 한 번만 조회하면 된다.
+    trace_id = res.headers.get('X-Trace-Id')
+    ok = res.status_code in (200, 201)
+
+    attempt.update({
+        "ok": ok,
+        "status": res.status_code,
+        "trace_id": trace_id,
+        "error_message": None if ok else extract_cafe24_error_message(res_json, f"HTTP {res.status_code}"),
+        "response_body": res_json,
+    })
+
+    logger.info(
+        f"[이미지등록 진단 응답] #{label} status={res.status_code} ok={ok} "
+        f"X-Trace-Id={trace_id} body={res_json}"
+    )
+    if not ok:
+        logger.error(f"[이미지등록 진단 실패 헤더] #{label} 전체 헤더={dict(res.headers)}")
+
+    return attempt
+
+
+@app.route('/api/debug/image-register-test', methods=['GET', 'POST'])
+def debug_image_register_test():
+    """카페24 "Wrong image path" 에러의 원인을 찾기 위한 진단 엔드포인트.
+
+    이미 FTP에 올라가 있는 파일 하나를 기준으로, image 파라미터에 넣을 수 있는 값의
+    후보를 순서대로 전부 시도하고 각 시도의 결과를 한꺼번에 반환한다.
+
+    사용법:
+      GET /api/debug/image-register-test?product_no=123&filename=processed_123.jpg
+      (filename 생략 시 static/processed_images의 가장 최근 파일 사용)
+
+    옵션:
+      skip_extra_ftp=true  -> 후보 7(/web/product/extra/excel/ 업로드)을 건너뜀
+      skip_base64=true     -> 후보 8(base64 data URI)을 건너뜀
+    """
+    payload = request.json if request.method == 'POST' and request.is_json else {}
+    payload = payload or {}
+
+    def _param(name, default=None):
+        value = request.args.get(name)
+        if value is None:
+            value = payload.get(name)
+        return default if value is None else value
+
+    product_no = _param('product_no')
+    if not product_no:
+        return jsonify({
+            "success": False,
+            "error": "product_no 파라미터가 필요합니다. 예: /api/debug/image-register-test?product_no=123"
+        }), 400
+    try:
+        product_no = int(product_no)
+    except (TypeError, ValueError):
+        return jsonify({"success": False, "error": f"product_no는 숫자여야 합니다: {product_no}"}), 400
+
+    filename = _param('filename')
+    if not filename:
+        local_files = [
+            f for f in os.listdir(UPLOAD_FOLDER)
+            if os.path.isfile(os.path.join(UPLOAD_FOLDER, f)) and not f.startswith('_ftp_test')
+        ]
+        if not local_files:
+            return jsonify({
+                "success": False,
+                "error": "filename 파라미터가 없고 static/processed_images에도 파일이 없습니다. "
+                         "먼저 변환(/api/convert)을 실행하거나 filename을 직접 지정해 주세요."
+            }), 400
+        filename = max(local_files, key=lambda f: os.path.getmtime(os.path.join(UPLOAD_FOLDER, f)))
+
+    filename = os.path.basename(filename)  # 경로 주입 방지
+    local_path = os.path.join(UPLOAD_FOLDER, filename)
+    local_exists = os.path.isfile(local_path)
+
+    skip_extra_ftp = str(_param('skip_extra_ftp', 'false')).lower() == 'true'
+    skip_base64 = str(_param('skip_base64', 'false')).lower() == 'true'
+
+    cafe24_host = f"{CAFE24_MALL_ID}.cafe24.com"
+    thumb_dir = '/web/upload/thumbnail/'
+
+    logger.info(
+        f"[이미지등록 진단 시작] product_no={product_no} filename={filename} "
+        f"local_exists={local_exists} skip_extra_ftp={skip_extra_ftp} skip_base64={skip_base64}"
+    )
+
+    # 후보 1~6: 이미 /web/upload/thumbnail/ 에 올라가 있는 파일 기준
+    candidates = [
+        ("1", "대표도메인 www 포함 절대URL",
+         f"https://www.{SHOP_PRIMARY_HOST}{thumb_dir}{filename}"),
+        ("2", "대표도메인 www 없이 절대URL",
+         f"https://{SHOP_PRIMARY_HOST}{thumb_dir}{filename}"),
+        ("3", "카페24 기본도메인 절대URL (/web 제외)",
+         f"https://{cafe24_host}/upload/thumbnail/{filename}"),
+        ("4", "상대경로 (/web 제외, 앞 슬래시 있음)",
+         f"/upload/thumbnail/{filename}"),
+        ("5", "상대경로 (앞 슬래시 없음)",
+         f"upload/thumbnail/{filename}"),
+        ("6", "파일명만", filename),
+    ]
+
+    attempts = []
+    skipped = []
+
+    for label, description, image_value in candidates:
+        attempts.append(_register_image_attempt(product_no, label, description, image_value))
+        time.sleep(0.4)  # 카페24 API 호출 제한(초당 요청 수)에 걸리지 않도록 간격을 둔다
+
+    # 후보 7: /web/product/extra/excel/ 에 FTP 업로드 후 절대URL/상대경로 두 형태로 시도
+    extra_ftp = {"attempted": False}
+    if skip_extra_ftp:
+        skipped.append({"candidate": "7", "reason": "skip_extra_ftp=true"})
+    elif not local_exists:
+        skipped.append({
+            "candidate": "7",
+            "reason": f"로컬 파일이 없어 FTP 업로드 불가: {local_path}"
+        })
+    else:
+        extra_ftp["attempted"] = True
+        # 업로드 성공 여부와 API 호출 결과를 섞지 않도록 try는 FTP 업로드까지만 감싼다.
+        try:
+            uploaded_url = upload_to_ftp(local_path, filename, remote_dir=CAFE24_EXTRA_IMAGE_DIR)
+            extra_ftp.update({"ok": True, "remote_dir": CAFE24_EXTRA_IMAGE_DIR, "ftp_url": uploaded_url})
+            logger.info(f"[이미지등록 진단] 후보7 FTP 업로드 성공: {uploaded_url}")
+        except Exception as e:
+            extra_ftp.update({"ok": False, "error": f"{type(e).__name__}: {e}"})
+            skipped.append({
+                "candidate": "7",
+                "reason": f"{CAFE24_EXTRA_IMAGE_DIR} FTP 업로드 실패: {type(e).__name__}: {e}"
+            })
+            logger.error(f"[이미지등록 진단] 후보7 FTP 업로드 실패: {type(e).__name__}: {e}")
+
+        if extra_ftp.get("ok"):
+            attempts.append(_register_image_attempt(
+                product_no, "7-a", f"{CAFE24_EXTRA_IMAGE_DIR} 업로드 후 절대URL",
+                f"https://{cafe24_host}{CAFE24_EXTRA_IMAGE_DIR}{filename}"
+            ))
+            time.sleep(0.4)
+            attempts.append(_register_image_attempt(
+                product_no, "7-b", f"{CAFE24_EXTRA_IMAGE_DIR} 업로드 후 상대경로",
+                f"{CAFE24_EXTRA_IMAGE_DIR}{filename}"
+            ))
+            time.sleep(0.4)
+
+    # 후보 8: base64 data URI를 image 값으로 직접 전달
+    if skip_base64:
+        skipped.append({"candidate": "8", "reason": "skip_base64=true"})
+    elif not local_exists:
+        skipped.append({"candidate": "8", "reason": f"로컬 파일이 없어 base64 인코딩 불가: {local_path}"})
+    else:
+        try:
+            with open(local_path, 'rb') as f:
+                encoded = base64.b64encode(f.read()).decode()
+            ext = os.path.splitext(filename)[1].lower()
+            mime = {'.png': 'image/png', '.gif': 'image/gif'}.get(ext, 'image/jpeg')
+            attempts.append(_register_image_attempt(
+                product_no, "8", f"base64 data URI ({mime})",
+                f"data:{mime};base64,{encoded}"
+            ))
+        except Exception as e:
+            skipped.append({"candidate": "8", "reason": f"base64 인코딩 실패: {type(e).__name__}: {e}"})
+            logger.error(f"[이미지등록 진단] 후보8 base64 인코딩 실패: {type(e).__name__}: {e}")
+
+    successes = [a for a in attempts if a.get("ok")]
+    logger.info(
+        f"[이미지등록 진단 종료] product_no={product_no} filename={filename} "
+        f"시도={len(attempts)}건 성공={[a['candidate'] for a in successes]} 건너뜀={skipped}"
+    )
+
+    return jsonify({
+        "success": True,
+        "product_no": product_no,
+        "filename": filename,
+        "local_file_exists": local_exists,
+        "summary": {
+            "total_attempts": len(attempts),
+            "success_count": len(successes),
+            "successful_candidates": [
+                {"candidate": a["candidate"], "description": a["description"], "image": a["image_preview"]}
+                for a in successes
+            ],
+            "any_success": bool(successes),
+        },
+        "extra_folder_ftp_upload": extra_ftp,
+        "skipped": skipped,
+        "attempts": attempts,
+    })
+
+
+# ==========================================
 # API Endpoints
 # ==========================================
 @app.route('/')

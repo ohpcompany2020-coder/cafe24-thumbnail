@@ -171,6 +171,55 @@ def cafe24_api_request(method, url, **kwargs):
 
     return res
 
+def _extract_single_product(res_json):
+    """GET /products/{product_no}(단수 리소스) 응답에서 상품 dict를 꺼낸다.
+
+    카페24는 목록 조회(GET /products)는 {"products": [...]} 복수 키로,
+    단건 조회(GET /products/{no})는 {"product": {...}} 단수 키로 응답한다.
+    단건 응답에서 'products'만 찾으면 항상 빈 값이 나와 list_image가 무조건
+    None으로 보이므로(실제 반영 여부와 무관하게) 두 형태를 모두 처리한다."""
+    if not isinstance(res_json, dict):
+        return None
+
+    product = res_json.get('product')
+    if isinstance(product, dict):
+        return product
+
+    products = res_json.get('products')
+    if isinstance(products, list) and products and isinstance(products[0], dict):
+        return products[0]
+    if isinstance(products, dict):  # 일부 응답이 단수 dict를 'products'로 주는 경우 대비
+        return products
+
+    return None
+
+
+def _extract_uploaded_image_path(res_json):
+    """POST /products/images 응답에서 업로드된 이미지 경로(path)를 꺼낸다.
+    응답 형태는 {"images": [{"product_no":.., "path": "https://.../NNEditor/.../x.jpg"}]}."""
+    if not isinstance(res_json, dict):
+        return None
+
+    images = res_json.get('images')
+    if images is None:
+        images = res_json.get('image')
+
+    if isinstance(images, dict):
+        images = [images]
+    if not isinstance(images, list):
+        return None
+
+    for entry in images:
+        if isinstance(entry, dict):
+            path = entry.get('path') or entry.get('image_path') or entry.get('url')
+            if path:
+                return path
+        elif isinstance(entry, str) and entry:
+            return entry
+
+    return None
+
+
 def extract_cafe24_error_message(res_json, default='API 호출 실패'):
     """카페24 에러 응답은 엔드포인트에 따라 {"error": {...}} 단수 형태와
     {"errors": [{...}, ...]} 복수 형태가 섞여 있어 둘 다 처리한다."""
@@ -728,6 +777,188 @@ def debug_image_register_test():
     })
 
 
+def _get_product_image_fields(product_no):
+    """상품의 현재 이미지 필드를 단건 조회해서 dict로 반환한다 (진단/검증용)."""
+    res = cafe24_api_request(
+        'GET', f"{CAFE24_API_BASE}/products/{product_no}",
+        params={"fields": "product_no,list_image,detail_image,tiny_image,small_image"}, timeout=10
+    )
+    res_json = res.json()
+    product = _extract_single_product(res_json) or {}
+    return {
+        "status": res.status_code,
+        "list_image": product.get('list_image'),
+        "detail_image": product.get('detail_image'),
+        "tiny_image": product.get('tiny_image'),
+        "small_image": product.get('small_image'),
+        "raw_keys": list(res_json.keys()) if isinstance(res_json, dict) else None,
+    }
+
+
+@app.route('/api/debug/product-link-test', methods=['GET', 'POST'])
+def debug_product_link_test():
+    """업로드된 이미지 경로를 "상품에 실제로 연결"하는 PUT 페이로드 형식을 찾는 진단 엔드포인트.
+
+    POST /products/images는 201로 성공해도 파일만 올라갈 뿐 상품에는 연결되지 않는다.
+    연결용 PUT /products/{no}의 정확한 필드 형식을 확정하기 위해 후보 페이로드를
+    순서대로 보내고, 매번 상품을 재조회해서 list_image가 실제로 바뀌었는지 확인한다.
+
+    사용법:
+      GET /api/debug/product-link-test?product_no=676&image_path=https://.../NNEditor/.../x.jpg
+
+    image_path를 생략하면 filename(또는 가장 최근 변환 파일)을 base64로 먼저 업로드해
+    반환된 path를 사용한다.
+    """
+    payload = request.json if request.method == 'POST' and request.is_json else {}
+    payload = payload or {}
+
+    def _param(name, default=None):
+        value = request.args.get(name)
+        if value is None:
+            value = payload.get(name)
+        return default if value is None else value
+
+    product_no = _param('product_no')
+    if not product_no:
+        return jsonify({"success": False, "error": "product_no 파라미터가 필요합니다."}), 400
+    try:
+        product_no = int(product_no)
+    except (TypeError, ValueError):
+        return jsonify({"success": False, "error": f"product_no는 숫자여야 합니다: {product_no}"}), 400
+
+    image_path = _param('image_path')
+    upload_step = {"performed": False}
+
+    # image_path가 없으면 base64 업로드부터 수행해서 path를 확보한다.
+    if not image_path:
+        filename = _param('filename')
+        if not filename:
+            local_files = [
+                f for f in os.listdir(UPLOAD_FOLDER)
+                if os.path.isfile(os.path.join(UPLOAD_FOLDER, f)) and not f.startswith('_ftp_test')
+            ]
+            if not local_files:
+                return jsonify({
+                    "success": False,
+                    "error": "image_path도 없고 변환된 이미지 파일도 없습니다. image_path를 직접 지정해 주세요."
+                }), 400
+            filename = max(local_files, key=lambda f: os.path.getmtime(os.path.join(UPLOAD_FOLDER, f)))
+
+        filename = os.path.basename(filename)
+        local_path = os.path.join(UPLOAD_FOLDER, filename)
+        if not os.path.isfile(local_path):
+            return jsonify({"success": False, "error": f"파일을 찾을 수 없습니다: {local_path}"}), 400
+
+        with open(local_path, 'rb') as f:
+            encoded = base64.b64encode(f.read()).decode()
+        ext = os.path.splitext(filename)[1].lower()
+        mime = {'.png': 'image/png', '.gif': 'image/gif'}.get(ext, 'image/jpeg')
+
+        upload_attempt = _register_image_attempt(
+            product_no, "upload", "base64 업로드로 image_path 확보",
+            f"data:{mime};base64,{encoded}"
+        )
+        upload_step = {"performed": True, "filename": filename, "attempt": upload_attempt}
+        if not upload_attempt.get("ok"):
+            return jsonify({
+                "success": False,
+                "error": "이미지 업로드(POST /products/images)가 실패해 연결 테스트를 진행할 수 없습니다.",
+                "upload_step": upload_step
+            }), 502
+        image_path = _extract_uploaded_image_path(upload_attempt.get("response_body"))
+        if not image_path:
+            return jsonify({
+                "success": False,
+                "error": "업로드 응답에서 path를 찾지 못했습니다.",
+                "upload_step": upload_step
+            }), 502
+
+    before = _get_product_image_fields(product_no)
+    logger.info(f"[연결 진단 시작] product_no={product_no} image_path={image_path} 현재상태={before}")
+
+    # 연결용 PUT 페이로드 후보들. 어떤 필드명/중첩 구조를 카페24가 실제로 반영하는지 확인한다.
+    candidates = [
+        ("A", "flat + image_upload_type=B (대표이미지등록, detail_image만)",
+         {"shop_no": 1, "request": {"image_upload_type": "B", "detail_image": image_path}}),
+        ("B", "flat + image_upload_type=A (4종 개별 지정)",
+         {"shop_no": 1, "request": {
+             "image_upload_type": "A",
+             "detail_image": image_path, "list_image": image_path,
+             "tiny_image": image_path, "small_image": image_path,
+         }}),
+        ("C", "flat, image_upload_type 없이 detail_image만",
+         {"shop_no": 1, "request": {"detail_image": image_path}}),
+        ("D", "기존 방식: request.images 중첩 구조",
+         {"shop_no": 1, "request": {"images": {"detail_image": image_path, "list_image": image_path}}}),
+    ]
+
+    attempts = []
+    api_url = f"{CAFE24_API_BASE}/products/{product_no}"
+
+    for label, description, body in candidates:
+        attempt = {"candidate": label, "description": description, "request_payload": body}
+        logger.info(f"[연결 진단 요청] #{label} ({description}) url={api_url} payload={body}")
+
+        try:
+            res = cafe24_api_request('PUT', api_url, json=body, timeout=20)
+        except Cafe24ReauthRequired as e:
+            attempt.update({"ok": False, "error": f"카페24 재인증 필요: {e}", "reauth_required": True})
+            attempts.append(attempt)
+            break
+        except Exception as e:
+            attempt.update({"ok": False, "error": f"{type(e).__name__}: {e}"})
+            attempts.append(attempt)
+            continue
+
+        try:
+            res_json = res.json()
+        except ValueError:
+            res_json = {"raw_text": res.text}
+
+        attempt.update({
+            "status": res.status_code,
+            "trace_id": res.headers.get('X-Trace-Id'),
+            "response_body": res_json,
+            "error_message": None if res.status_code == 200 else extract_cafe24_error_message(
+                res_json, f"HTTP {res.status_code}"),
+        })
+        logger.info(f"[연결 진단 응답] #{label} status={res.status_code} body={res_json}")
+
+        # PUT이 200이어도 실제로 반영됐는지는 재조회로만 확인할 수 있다
+        # (카페24는 모르는 필드를 200과 함께 조용히 무시한다).
+        time.sleep(1)
+        after = _get_product_image_fields(product_no)
+        linked = bool(after.get('list_image')) and after.get('list_image') != before.get('list_image')
+        attempt.update({
+            "after": after,
+            "ok": res.status_code == 200 and linked,
+            "actually_linked": linked,
+        })
+        logger.info(f"[연결 진단 검증] #{label} 반영여부={linked} after={after}")
+
+        attempts.append(attempt)
+        if linked:
+            logger.info(f"[연결 진단] #{label} 형식이 실제로 반영됨 - 이후 후보는 시도하지 않음")
+            break
+        time.sleep(0.4)
+
+    winners = [a for a in attempts if a.get("actually_linked")]
+
+    return jsonify({
+        "success": True,
+        "product_no": product_no,
+        "image_path": image_path,
+        "upload_step": upload_step,
+        "before": before,
+        "summary": {
+            "working_candidate": winners[0]["candidate"] if winners else None,
+            "working_description": winners[0]["description"] if winners else None,
+            "any_linked": bool(winners),
+        },
+        "attempts": attempts,
+    })
+
+
 # ==========================================
 # API Endpoints
 # ==========================================
@@ -1008,13 +1239,29 @@ def send_to_cafe24():
                 fail_list.append({"product_no": p_no, "reason": img_err_msg})
                 continue
 
-            # [추가이미지 제어] 대표 이미지와 달리 add_image는 PUT /products/{no}의
-            # 별도 필드이며 base64 진단 대상이 아니었으므로, 기존 FTP 업로드 URL 방식을
-            # 그대로 유지한다 (지금까지 이 경로에서 문제가 보고된 적은 없음).
-            images_payload = {}
+            # POST /products/images는 파일을 몰의 이미지 저장소(/web/upload/NNEditor/...)에
+            # 올리고 그 경로만 돌려주는 "업로드" API다. 반환된 경로를 상품에 다시 연결하는
+            # PUT을 보내지 않으면 파일만 서버에 남고 상품 이미지는 그대로다 - 업로드는
+            # 201로 성공하는데 list_image가 안 바뀌던 원인.
+            uploaded_path = _extract_uploaded_image_path(img_res_json)
+            if not uploaded_path:
+                raise Exception(f"이미지 업로드 응답에서 path를 찾지 못했습니다: {img_res_json}")
+            logger.info(f"[카페24 이미지 업로드 경로] product_no={p_no} path={uploaded_path}")
+
+            # [추가이미지] 조회 응답에서 추가이미지를 읽을 때 쓰는 필드명이 'additional_image'
+            # 이므로(위 search_products 참고) 쓰기도 같은 이름을 쓴다. 기존의
+            # {"images": {"add_image": [...]}} 중첩 구조는 카페24가 모르는 필드라
+            # 200을 반환하면서도 조용히 무시했을 가능성이 높다.
+            put_request = {
+                # 카페24 관리자 설정이 "대표이미지등록"이므로 원본 1장만 넘기면
+                # list/tiny/small은 카페24가 자동 리사이징한다.
+                "image_upload_type": "B",
+                "detail_image": uploaded_path,
+            }
+
             if mode == 'model':
                 # [모델컷 모드] 추가이미지 일괄 삭제
-                images_payload["add_image"] = []
+                put_request["additional_image"] = []
             elif mode == 'product':
                 # [제품컷 모드] 추가이미지도 상하여백 가공 후 업데이트
                 raw_add_images = item.get('add_images', [])
@@ -1030,10 +1277,10 @@ def send_to_cafe24():
                     ftp_add_url = upload_to_ftp(out_add_path, out_add_file)
                     processed_add_urls.append(ftp_add_url)
 
-                images_payload["add_image"] = processed_add_urls
+                put_request["additional_image"] = processed_add_urls
 
             api_url = f"{CAFE24_API_BASE}/products/{p_no}"
-            request_body = {"request": {"images": images_payload}}
+            request_body = {"shop_no": 1, "request": put_request}
             logger.info(f"[카페24 PUT 요청] product_no={p_no} url={api_url} payload={request_body}")
 
             res = cafe24_api_request('PUT', api_url, json=request_body, timeout=15)
@@ -1051,8 +1298,10 @@ def send_to_cafe24():
                         'GET', f"{CAFE24_API_BASE}/products/{p_no}",
                         params={"fields": "list_image,detail_image"}, timeout=10
                     )
-                    verify_products = verify_get.json().get('products', [])
-                    current_list_image = verify_products[0].get('list_image') if verify_products else None
+                    verify_json = verify_get.json()
+                    logger.info(f"[카페24 상품 재조회 원문] product_no={p_no} body={verify_json}")
+                    verify_product = _extract_single_product(verify_json)
+                    current_list_image = verify_product.get('list_image') if verify_product else None
                     logger.info(f"[카페24 현재 list_image 재조회] product_no={p_no} list_image={current_list_image}")
                     if current_list_image:
                         verify_image_dimensions(p_no, 'list_image', current_list_image)

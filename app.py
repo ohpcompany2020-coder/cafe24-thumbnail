@@ -867,7 +867,9 @@ CAFE24_IMAGE_UPLOAD_TYPE = os.getenv('CAFE24_IMAGE_UPLOAD_TYPE', 'C')
 #   "Only Base64 encoding format is supported for additional images."
 #   more_info: {"additional_image": ["base64 encoded image"]}
 # 전용 리소스 PUT /products/{no}/additionalimages 에 additional_image 배열로 보낸다.
-# base64를 data URI 접두사와 함께 보낼지 여부 (POST /products/images에서는 data URI가 통했다)
+# 진단 결과 data URI 접두사가 있든(E) 없든(F) 둘 다 등록에 성공했다. 접두사가 있는 쪽을
+# 기본으로 쓴다 - MIME 타입을 명시하므로 PNG/GIF 원본에서 서버 추측에 기대지 않아도 되고,
+# POST /products/images(대표이미지 base64 시도)에서 통했던 형식과도 같다.
 ADDITIONAL_IMAGE_AS_DATA_URI = os.getenv('ADDITIONAL_IMAGE_AS_DATA_URI', 'true').lower() != 'false'
 
 
@@ -1296,21 +1298,35 @@ def debug_additional_image_put_test():
             except ValueError:
                 res_json = {"raw_text": res.text[:2000]}
 
+            # 반영 판정은 PUT 응답 본문을 우선한다. 카페24는 방금 등록한 이미지 경로를
+            # 응답에 그대로 돌려주는 반면, 직후 재조회는 아직 반영 전 값을 주기도 한다
+            # (대표이미지 진단에서 성공을 실패로 오판했던 것과 같은 원인).
+            response_images, _ = _extract_additional_images(res_json)
+
             attempt.update({
                 "status": res.status_code,
                 "response_body": str(res_json)[:2000],
+                "response_images": response_images,
                 "error_message": None if res.status_code == 200 else extract_cafe24_error_message(
                     res_json, f"HTTP {res.status_code}"),
             })
 
-            time.sleep(1.5)  # 반영 시차
+            time.sleep(2)  # 반영 시차를 감안해 재조회 전 대기
             after = fetch_additional_images(product_no)
+            changed = bool(response_images) or (after != baseline)
+
             attempt.update({
                 "after": after,
-                "changed": after != baseline,
-                "ok": res.status_code == 200 and after != baseline,
+                "changed_in_response": bool(response_images),
+                "changed_in_requery": after != baseline,
+                "changed": changed,
+                "ok": res.status_code in (200, 201) and changed,
             })
-            logger.info(f"[추가이미지 PUT 진단] {label} status={res.status_code} 반영={after != baseline} after={after}")
+            logger.info(
+                f"[추가이미지 PUT 진단] {label} status={res.status_code} 반영={changed} "
+                f"(응답기준={bool(response_images)} 재조회기준={after != baseline}) "
+                f"응답이미지={response_images} after={after}"
+            )
         except Exception as e:
             attempt.update({"ok": False, "error": f"{type(e).__name__}: {e}"})
             logger.error(f"[추가이미지 PUT 진단] {label} 예외: {e}")
@@ -1486,13 +1502,17 @@ def _normalize_additional_image(entry):
     return None
 
 
-def _extract_additional_images(payload):
+def _extract_additional_images(payload, _depth=0):
     """응답에서 추가이미지 URL 목록을 뽑는다.
 
     반환값은 (urls, found)이다. found는 "추가이미지 키가 응답에 존재했는지"로,
     빈 목록(추가이미지가 정말 없음)과 키 자체가 없음(조회 방식이 틀림)을 구분하기 위해
-    필요하다 - 이 둘을 섞으면 전 상품에 불필요한 재조회를 돌게 된다."""
-    if not isinstance(payload, dict):
+    필요하다 - 이 둘을 섞으면 전 상품에 불필요한 재조회를 돌게 된다.
+
+    카페24 응답은 키가 한 겹 더 중첩돼 있을 수 있어 재귀로 내려간다. 예:
+      {"additionalimage": {"shop_no": 1, "additional_image": [{"big": ..., ...}]}}
+    바깥 'additionalimage'만 보고 멈추면 dict를 이미지 1건으로 오해해 빈 목록이 나온다."""
+    if not isinstance(payload, dict) or _depth > 4:
         return [], False
 
     container = None
@@ -1507,18 +1527,17 @@ def _extract_additional_images(payload):
     # {"product": {...}} / {"products": [...]} 로 한 겹 감싸인 응답도 처리
     if not found:
         product = _extract_single_product(payload)
-        if isinstance(product, dict):
-            for key in ADDITIONAL_IMAGE_KEYS:
-                if key in product:
-                    container = product[key]
-                    found = True
-                    break
-
-    if not found:
+        if isinstance(product, dict) and product is not payload:
+            return _extract_additional_images(product, _depth + 1)
         return [], False
 
+    # 컨테이너가 dict면 그 안에 실제 목록이 한 겹 더 들어있을 수 있다.
     if isinstance(container, dict):
-        container = [container]
+        nested_urls, nested_found = _extract_additional_images(container, _depth + 1)
+        if nested_found:
+            return nested_urls, True
+        container = [container]  # 중첩이 아니라 이미지 1건이 dict로 온 경우
+
     if not isinstance(container, list):
         return [], True
 
@@ -2130,13 +2149,19 @@ def send_to_cafe24():
                     fail_list.append({"product_no": p_no, "reason": f"추가이미지: {err_msg}"})
                     continue
 
-                time.sleep(1.5)  # 반영 시차
-                after_add = fetch_additional_images(p_no)
+                # 응답 본문에 방금 등록된 경로가 그대로 돌아온다. 직후 재조회는 아직
+                # 반영 전 값을 줄 수 있으므로 응답 본문을 먼저 신뢰한다.
+                registered_images, _ = _extract_additional_images(add_res_json)
                 additional_sent = len(encoded_images)
                 logger.info(
                     f"[추가이미지 반영 확인] product_no={p_no} 전송 {len(encoded_images)}장 -> "
-                    f"현재 {len(after_add)}장 {after_add}"
+                    f"응답에 등록된 경로 {len(registered_images)}장 {registered_images}"
                 )
+                if encoded_images and not registered_images:
+                    logger.warning(
+                        f"[추가이미지 확인 불가] product_no={p_no} 200을 받았지만 응답에서 "
+                        f"등록된 이미지를 찾지 못했습니다. 응답={str(add_res_json)[:500]}"
+                    )
             else:
                 # 추가이미지가 없는 상품에는 요청 자체를 보내지 않는다 (실수로 지우지 않도록).
                 logger.info(f"[추가이미지 요청 생략] product_no={p_no} 상품에 추가이미지가 없음")

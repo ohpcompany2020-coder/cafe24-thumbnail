@@ -863,6 +863,11 @@ PRODUCT_IMAGE_FIELDS = ('detail_image', 'list_image', 'small_image', 'tiny_image
 # (진단에서 F=C+detail_image, J=B+4종이 각각 반영 확인됨. 형식만 바꿔볼 수 있도록 상수로 둔다)
 CAFE24_IMAGE_UPLOAD_TYPE = os.getenv('CAFE24_IMAGE_UPLOAD_TYPE', 'C')
 
+# PUT /products/{no}로 추가이미지를 보낼 때 쓸 필드명. 조회 응답의 키는 'additionalimages'
+# (언더스코어 없는 복수형)로 확인됐지만, 쓰기 필드명이 조회 키와 같다는 보장은 없다.
+# /api/debug/additional-image-put-test로 확정한 뒤 이 값을 맞추면 된다.
+CAFE24_ADDITIONAL_IMAGE_FIELD = os.getenv('CAFE24_ADDITIONAL_IMAGE_FIELD', 'additional_image')
+
 
 def _changed_image_fields(before, after):
     """before 대비 after에서 새 값으로 바뀐 이미지 필드명 목록을 돌려준다."""
@@ -1166,6 +1171,129 @@ def debug_additional_images_test():
     })
 
 
+@app.route('/api/debug/additional-image-put-test', methods=['GET'])
+def debug_additional_image_put_test():
+    """추가이미지를 "다시 보낼 때"의 정확한 요청 형식을 찾는 진단 엔드포인트.
+
+    조회 키는 'additionalimages'(객체 배열)로 확인됐지만, 쓰기 필드명과 값 형식이
+    조회와 같다는 보장이 없다. 상품 PUT의 필드명 2가지와 전용 리소스 PUT 2가지를
+    순서대로 시도하고, 매번 추가이미지를 다시 읽어 실제로 반영됐는지 확인한다.
+
+    ※ 이 테스트는 대상 상품의 추가이미지를 실제로 교체한다. 반드시 테스트용 상품으로만
+       실행할 것. 실행 전 현재 추가이미지 목록을 baseline으로 남기므로, 필요하면
+       그 목록을 보고 수동 복구할 수 있다.
+
+    사용법:
+      GET /api/debug/additional-image-put-test?product_no=676&filename=processed_676_add_0.jpg&confirm=yes
+    """
+    product_no = request.args.get('product_no')
+    filename = request.args.get('filename')
+    if not product_no:
+        return jsonify({"success": False, "error": "product_no 파라미터가 필요합니다."}), 400
+
+    if request.args.get('confirm') != 'yes':
+        return jsonify({
+            "success": False,
+            "error": "이 테스트는 대상 상품의 추가이미지를 실제로 교체합니다. "
+                     "테스트용 상품인지 확인 후 confirm=yes 를 붙여 다시 호출해 주세요.",
+            "current_additional_images": fetch_additional_images(product_no),
+        }), 400
+
+    # 변환 파일이 지정되지 않으면 가장 최근 변환 파일을 쓴다
+    if not filename:
+        local_files = [
+            f for f in os.listdir(UPLOAD_FOLDER)
+            if os.path.isfile(os.path.join(UPLOAD_FOLDER, f)) and not f.startswith('_ftp_test')
+        ]
+        if not local_files:
+            return jsonify({"success": False, "error": "변환된 이미지가 없습니다. 먼저 변환을 실행해 주세요."}), 400
+        filename = max(local_files, key=lambda f: os.path.getmtime(os.path.join(UPLOAD_FOLDER, f)))
+
+    filename = os.path.basename(filename)
+    local_path = os.path.join(UPLOAD_FOLDER, filename)
+    if not os.path.isfile(local_path):
+        return jsonify({"success": False, "error": f"파일을 찾을 수 없습니다: {local_path}"}), 400
+
+    baseline = fetch_additional_images(product_no)
+    logger.warning(f"[추가이미지 PUT 진단] product_no={product_no} 변경 전 목록(복구용)={baseline}")
+
+    remote_dir = '/web/upload/thumbnail/'
+    try:
+        upload_to_ftp(local_path, filename, remote_dir=remote_dir)
+    except Exception as e:
+        return jsonify({"success": False, "error": f"FTP 업로드 실패: {type(e).__name__}: {e}"}), 502
+
+    ftp_path = f"{remote_dir}{filename}"
+    product_url = f"{CAFE24_API_BASE}/products/{product_no}"
+    resource_url = f"{CAFE24_API_BASE}/products/{product_no}/additionalimages"
+
+    candidates = [
+        ("A. 상품 PUT + additional_image (문자열 배열)", product_url,
+         {"shop_no": 1, "request": {"image_upload_type": CAFE24_IMAGE_UPLOAD_TYPE,
+                                    "additional_image": [ftp_path]}}),
+        ("B. 상품 PUT + additionalimages (문자열 배열)", product_url,
+         {"shop_no": 1, "request": {"image_upload_type": CAFE24_IMAGE_UPLOAD_TYPE,
+                                    "additionalimages": [ftp_path]}}),
+        ("C. 전용 리소스 PUT + additional_image", resource_url,
+         {"shop_no": 1, "request": {"additional_image": [ftp_path]}}),
+        ("D. 전용 리소스 PUT + additionalimages", resource_url,
+         {"shop_no": 1, "request": {"additionalimages": [ftp_path]}}),
+    ]
+
+    attempts = []
+    for label, url, body in candidates:
+        attempt = {"label": label, "url": url, "request_payload": body}
+        logger.info(f"[추가이미지 PUT 진단] {label} url={url} payload={body}")
+
+        try:
+            res = cafe24_api_request('PUT', url, json=body, timeout=20)
+            try:
+                res_json = res.json()
+            except ValueError:
+                res_json = {"raw_text": res.text[:2000]}
+
+            attempt.update({
+                "status": res.status_code,
+                "response_body": str(res_json)[:2000],
+                "error_message": None if res.status_code == 200 else extract_cafe24_error_message(
+                    res_json, f"HTTP {res.status_code}"),
+            })
+
+            time.sleep(1.5)  # 반영 시차
+            after = fetch_additional_images(product_no)
+            attempt.update({
+                "after": after,
+                "changed": after != baseline,
+                "ok": res.status_code == 200 and after != baseline,
+            })
+            logger.info(f"[추가이미지 PUT 진단] {label} status={res.status_code} 반영={after != baseline} after={after}")
+        except Exception as e:
+            attempt.update({"ok": False, "error": f"{type(e).__name__}: {e}"})
+            logger.error(f"[추가이미지 PUT 진단] {label} 예외: {e}")
+
+        attempts.append(attempt)
+        if attempt.get("ok"):
+            logger.info(f"[추가이미지 PUT 진단] {label} 형식이 실제로 반영됨 - 이후 후보 중단")
+            break
+        time.sleep(0.4)
+
+    winners = [a for a in attempts if a.get("ok")]
+    return jsonify({
+        "success": True,
+        "product_no": product_no,
+        "sent_path": ftp_path,
+        "baseline_additional_images": baseline,
+        "restore_hint": "원래 상태로 되돌리려면 baseline_additional_images의 이미지를 "
+                        "카페24 관리자에서 다시 등록하세요.",
+        "summary": {
+            "working_method": winners[0]["label"] if winners else None,
+            "working_payload": winners[0]["request_payload"] if winners else None,
+            "any_worked": bool(winners),
+        },
+        "attempts": attempts,
+    })
+
+
 # ==========================================
 # API Endpoints
 # ==========================================
@@ -1294,9 +1422,11 @@ def fetch_product_total_count(search_params):
 # 카페24 응답에서 추가이미지가 담겨 오는 키 후보. API 버전에 따라 이름이 다를 수 있어
 # 알려진 형태를 모두 확인한다.
 ADDITIONAL_IMAGE_KEYS = (
-    'additionalimage', 'additional_image', 'additionalimages', 'additional_images',
+    # 진단으로 확인된 실제 키(언더스코어 없는 복수형). 나머지는 방어용 후보.
+    'additionalimages', 'additionalimage', 'additional_images', 'additional_image',
 )
-# 추가이미지 1건이 dict로 올 때, 원본에 가장 가까운 크기부터 우선 사용한다.
+# 추가이미지 1건은 {"big": url, "medium": url, "small": url} 객체로 온다.
+# 변환 소스로는 가장 고화질인 "big"을 쓴다.
 ADDITIONAL_IMAGE_URL_KEYS = ('big', 'medium', 'small', 'image', 'path', 'url')
 
 
@@ -1892,7 +2022,7 @@ def send_to_cafe24():
             if has_additional_images:
                 # 상품이 추가이미지를 가진 경우에만 필드를 보낸다. 빈 배열이면 전체 삭제가
                 # 되지만, 이는 사용자가 모든 추가이미지를 체크 해제한 의도적 결과다.
-                put_request["additional_image"] = processed_add_urls
+                put_request[CAFE24_ADDITIONAL_IMAGE_FIELD] = processed_add_urls
                 logger.info(
                     f"[추가이미지 반영] product_no={p_no} {len(processed_add_urls)}장 전송 "
                     f"{processed_add_urls}"

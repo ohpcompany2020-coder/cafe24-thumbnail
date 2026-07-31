@@ -1104,6 +1104,68 @@ def debug_product_link_test():
     })
 
 
+@app.route('/api/debug/additional-images-test', methods=['GET'])
+def debug_additional_images_test():
+    """추가이미지를 어느 경로로 조회해야 하는지, 응답의 정확한 필드명이 무엇인지 확인한다.
+
+    상품 목록 응답에는 추가이미지가 기본 포함되지 않으므로, 아래 4가지를 모두 호출해
+    각각의 원문과 추출 결과를 함께 돌려준다.
+
+    사용법: GET /api/debug/additional-images-test?product_no=676
+    """
+    product_no = request.args.get('product_no')
+    if not product_no:
+        return jsonify({"success": False, "error": "product_no 파라미터가 필요합니다."}), 400
+
+    attempts = []
+
+    def _try(label, method, url, **kwargs):
+        attempt = {"label": label, "url": url, "params": kwargs.get('params')}
+        try:
+            res = cafe24_api_request(method, url, timeout=15, **kwargs)
+            attempt["status"] = res.status_code
+            try:
+                payload = res.json()
+            except ValueError:
+                payload = {"raw_text": res.text[:2000]}
+
+            urls, found = _extract_additional_images(payload)
+            attempt.update({
+                "additional_image_key_present": found,
+                "extracted_count": len(urls),
+                "extracted_urls": urls,
+                "top_level_keys": list(payload.keys()) if isinstance(payload, dict) else None,
+                # 필드명을 눈으로 확인할 수 있게 응답 원문을 그대로(길면 잘라서) 남긴다
+                "raw_body": str(payload)[:3000],
+            })
+            logger.info(f"[추가이미지 진단] {label} status={res.status_code} 추출={len(urls)}장 body={str(payload)[:1000]}")
+        except Exception as e:
+            attempt["error"] = f"{type(e).__name__}: {e}"
+            logger.error(f"[추가이미지 진단] {label} 예외: {e}")
+        attempts.append(attempt)
+
+    base = CAFE24_API_BASE
+    _try("A. 전용 리소스 (additionalimages)", 'GET', f"{base}/products/{product_no}/additionalimages")
+    _try("B. 단건 조회 + embed", 'GET', f"{base}/products/{product_no}",
+         params={"embed": "additionalimages"})
+    _try("C. 목록 조회 + embed (현재 검색이 쓰는 방식)", 'GET', f"{base}/products",
+         params={"product_no": product_no, "embed": "additionalimages"})
+    _try("D. 목록 조회 (embed 없음 - 기존 방식)", 'GET', f"{base}/products",
+         params={"product_no": product_no})
+
+    working = [a for a in attempts if a.get("extracted_count")]
+    return jsonify({
+        "success": True,
+        "product_no": product_no,
+        "summary": {
+            "working_method": working[0]["label"] if working else None,
+            "additional_image_count": working[0]["extracted_count"] if working else 0,
+            "any_found": bool(working),
+        },
+        "attempts": attempts,
+    })
+
+
 # ==========================================
 # API Endpoints
 # ==========================================
@@ -1229,6 +1291,131 @@ def fetch_product_total_count(search_params):
         return None
 
 
+# 카페24 응답에서 추가이미지가 담겨 오는 키 후보. API 버전에 따라 이름이 다를 수 있어
+# 알려진 형태를 모두 확인한다.
+ADDITIONAL_IMAGE_KEYS = (
+    'additionalimage', 'additional_image', 'additionalimages', 'additional_images',
+)
+# 추가이미지 1건이 dict로 올 때, 원본에 가장 가까운 크기부터 우선 사용한다.
+ADDITIONAL_IMAGE_URL_KEYS = ('big', 'medium', 'small', 'image', 'path', 'url')
+
+
+def _normalize_additional_image(entry):
+    """추가이미지 1건(문자열 또는 dict)에서 이미지 URL을 뽑는다."""
+    if isinstance(entry, str):
+        return entry or None
+    if isinstance(entry, dict):
+        for key in ADDITIONAL_IMAGE_URL_KEYS:
+            value = entry.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
+def _extract_additional_images(payload):
+    """응답에서 추가이미지 URL 목록을 뽑는다.
+
+    반환값은 (urls, found)이다. found는 "추가이미지 키가 응답에 존재했는지"로,
+    빈 목록(추가이미지가 정말 없음)과 키 자체가 없음(조회 방식이 틀림)을 구분하기 위해
+    필요하다 - 이 둘을 섞으면 전 상품에 불필요한 재조회를 돌게 된다."""
+    if not isinstance(payload, dict):
+        return [], False
+
+    container = None
+    found = False
+
+    for key in ADDITIONAL_IMAGE_KEYS:
+        if key in payload:
+            container = payload[key]
+            found = True
+            break
+
+    # {"product": {...}} / {"products": [...]} 로 한 겹 감싸인 응답도 처리
+    if not found:
+        product = _extract_single_product(payload)
+        if isinstance(product, dict):
+            for key in ADDITIONAL_IMAGE_KEYS:
+                if key in product:
+                    container = product[key]
+                    found = True
+                    break
+
+    if not found:
+        return [], False
+
+    if isinstance(container, dict):
+        container = [container]
+    if not isinstance(container, list):
+        return [], True
+
+    urls = [url for url in (_normalize_additional_image(e) for e in container) if url]
+    return urls, True
+
+
+def fetch_additional_images(product_no):
+    """상품 1건의 추가이미지를 전용 리소스로 조회한다.
+
+    카페24는 상품 목록(GET /products) 응답에 추가이미지를 기본 포함하지 않으므로,
+    embed로도 받지 못했을 때 이 엔드포인트로 상품마다 따로 조회한다."""
+    try:
+        res = cafe24_api_request(
+            'GET', f"{CAFE24_API_BASE}/products/{product_no}/additionalimages", timeout=10
+        )
+        if res.status_code >= 400:
+            logger.warning(
+                f"[추가이미지 조회 실패] product_no={product_no} "
+                f"status={res.status_code} body={res.text[:300]}"
+            )
+            return []
+
+        payload = res.json()
+        urls, _ = _extract_additional_images(payload)
+        if not urls:
+            logger.info(f"[추가이미지 조회] product_no={product_no} 0장 (응답={str(payload)[:300]})")
+        return urls
+    except Exception as e:
+        logger.warning(f"[추가이미지 조회 예외] product_no={product_no}: {e}")
+        return []
+
+
+def attach_additional_images(products, budget_seconds=IMAGE_PROBE_BUDGET, max_workers=12):
+    """추가이미지를 아직 못 받은 상품들에 대해 전용 리소스로 병렬 조회해 채운다.
+    상품 수만큼 API 호출이 필요하므로 전체 시간 상한을 둔다."""
+    targets = [p for p in products if not p.get('add_images_loaded')]
+    if not targets:
+        return
+
+    started = time.monotonic()
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    try:
+        future_to_product = {
+            executor.submit(fetch_additional_images, p['product_no']): p for p in targets
+        }
+        done, not_done = futures_wait(future_to_product.keys(), timeout=budget_seconds)
+
+        for future in done:
+            product = future_to_product[future]
+            try:
+                product['add_images'] = future.result()
+                product['add_images_loaded'] = True
+            except Exception as e:
+                logger.warning(f"[추가이미지 조회 예외] product_no={product['product_no']}: {e}")
+
+        for future in not_done:
+            future.cancel()
+            logger.warning(
+                f"[추가이미지 조회 시간초과] product_no={future_to_product[future]['product_no']}"
+            )
+    finally:
+        executor.shutdown(wait=False)
+
+    total = sum(len(p.get('add_images') or []) for p in targets)
+    logger.info(
+        f"[추가이미지 보완 조회] {len(targets)}개 상품 {time.monotonic() - started:.1f}초, "
+        f"총 {total}장 확인"
+    )
+
+
 def is_product_available(product):
     """진열함 + 판매함 + 품절아님 상태인지 판정한다.
 
@@ -1280,7 +1467,9 @@ def search_products():
             return jsonify({"success": False, "error": "검색어를 입력해 주세요."}), 400
 
         search_params = build_product_search_params(search_type, keyword)
-        params = {**search_params, "limit": limit, "offset": offset}
+        # embed로 추가이미지를 함께 받아 상품마다 따로 호출하는 것을 피한다.
+        # (지원되지 않으면 무시되거나 키가 안 오고, 그때는 전용 리소스로 보완 조회한다)
+        params = {**search_params, "limit": limit, "offset": offset, "embed": "additionalimages"}
         if sort:
             params['sort'] = sort
         if order:
@@ -1348,9 +1537,9 @@ def search_products():
             filename = os.path.basename(main_image.split('?')[0]) if main_image else f"{product_no}.jpg"
             ext = os.path.splitext(filename)[1].lstrip('.').upper() or 'JPG'
 
-            # 카페24 API 버전에 따라 추가이미지 필드명이 다를 수 있어 기본값은 빈 배열로 처리
-            raw_add_images = p.get('additional_image')
-            add_images = [img for img in raw_add_images if img] if isinstance(raw_add_images, list) else []
+            # 추가이미지는 embed로 함께 받아온 경우에만 여기서 채워진다. 키 자체가 없으면
+            # (embed 미지원 등) 아래에서 전용 리소스로 다시 조회한다.
+            add_images, add_images_found = _extract_additional_images(p)
 
             products.append({
                 "product_no": str(product_no),
@@ -1360,6 +1549,7 @@ def search_products():
                 "filename": filename,
                 "format": ext,
                 "add_images": add_images,
+                "add_images_loaded": add_images_found,
                 "display": p.get('display'),
                 "selling": p.get('selling'),
                 "sold_out": p.get('sold_out'),
@@ -1392,12 +1582,21 @@ def search_products():
 
             products = kept
 
+        # 추가이미지 보완 조회: 목록 응답에 추가이미지 키가 아예 없었던 상품만 대상으로
+        # 전용 리소스를 호출한다. 필터를 모두 통과한 상품에 대해서만 하므로 호출 수가 적다.
+        if products:
+            attach_additional_images(products)
+        for product in products:
+            product.pop('add_images_loaded', None)
+
         excluded_ratio_count = len(excluded) - excluded_status_count
         elapsed = time.monotonic() - page_started
+        total_add_images = sum(len(p.get('add_images') or []) for p in products)
         logger.info(
             f"[페이지 처리 완료] offset={offset} 소요시간 {elapsed:.1f}초 - "
             f"조회 {fetched_count}건 중 {len(products)}건 표시 "
-            f"(상태 제외 {excluded_status_count}건 / 비1:1 제외 {excluded_ratio_count}건)"
+            f"(상태 제외 {excluded_status_count}건 / 비1:1 제외 {excluded_ratio_count}건 / "
+            f"추가이미지 합계 {total_add_images}장)"
         )
 
         return jsonify({

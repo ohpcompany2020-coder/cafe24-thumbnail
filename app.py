@@ -829,6 +829,13 @@ def debug_product_link_test():
     image_path = _param('image_path')
     upload_step = {"performed": False}
 
+    # [중요] 기준점(baseline)은 반드시 "업로드 전"에 찍어야 한다. 업로드 후에 찍으면
+    # POST /products/images가 이미 상품에 연결까지 해버린 경우 baseline에 새 경로가
+    # 들어가고, 이후 PUT 후보들은 전부 "바뀐 게 없다"(new == new)로 보여 false negative가
+    # 난다 - 4개 후보가 모두 실패로 보고된 원인일 수 있다.
+    baseline = _get_product_image_fields(product_no)
+    logger.info(f"[연결 진단 baseline(업로드 전)] product_no={product_no} {baseline}")
+
     # image_path가 없으면 base64 업로드부터 수행해서 path를 확보한다.
     if not image_path:
         filename = _param('filename')
@@ -873,7 +880,63 @@ def debug_product_link_test():
                 "upload_step": upload_step
             }), 502
 
-    before = _get_product_image_fields(product_no)
+    attempts = []
+    api_url = f"{CAFE24_API_BASE}/products/{product_no}"
+
+    # [후보 E] PUT을 아예 보내지 않고, 업로드만으로 상품에 연결됐는지 확인한다.
+    # POST /products/images 요청 payload에 이미 product_no가 들어가므로, 이 API가
+    # 업로드와 상품 연결을 한 번에 처리할 가능성이 있다. 그렇다면 PUT 단계 자체가
+    # 불필요하다.
+    if upload_step.get("performed"):
+        time.sleep(2)  # 카페24 쪽 반영 시차를 감안해 잠시 대기
+        after_upload = _get_product_image_fields(product_no)
+        linked_by_upload = (
+            bool(after_upload.get('list_image'))
+            and after_upload.get('list_image') != baseline.get('list_image')
+        )
+        attempts.append({
+            "candidate": "E",
+            "description": "PUT 없이 base64 업로드(POST /products/images)만으로 연결되는지 확인",
+            "request_payload": None,
+            "status": upload_step["attempt"].get("status"),
+            "before": baseline,
+            "after": after_upload,
+            "actually_linked": linked_by_upload,
+            "ok": linked_by_upload,
+        })
+        logger.info(
+            f"[연결 진단 #E] 업로드만으로 반영여부={linked_by_upload} "
+            f"baseline_list_image={baseline.get('list_image')} after_list_image={after_upload.get('list_image')}"
+        )
+        before = after_upload
+    else:
+        attempts.append({
+            "candidate": "E",
+            "description": "PUT 없이 업로드만으로 연결되는지 확인",
+            "skipped": True,
+            "reason": "image_path를 직접 지정해 업로드를 수행하지 않았으므로 테스트 불가",
+            "actually_linked": False,
+            "ok": False,
+        })
+        before = baseline
+
+    # 후보 E가 성공하면 PUT 후보는 시도할 필요가 없다.
+    if attempts[0].get("actually_linked"):
+        logger.info("[연결 진단] 업로드만으로 상품 연결 완료 - PUT 후보는 시도하지 않음")
+        return jsonify({
+            "success": True,
+            "product_no": product_no,
+            "image_path": image_path,
+            "upload_step": upload_step,
+            "baseline_before_upload": baseline,
+            "summary": {
+                "working_candidate": "E",
+                "working_description": "POST /products/images 단독으로 업로드+상품연결이 모두 완료됨 (PUT 불필요)",
+                "any_linked": True,
+            },
+            "attempts": attempts,
+        })
+
     logger.info(f"[연결 진단 시작] product_no={product_no} image_path={image_path} 현재상태={before}")
 
     # 연결용 PUT 페이로드 후보들. 어떤 필드명/중첩 구조를 카페24가 실제로 반영하는지 확인한다.
@@ -891,9 +954,6 @@ def debug_product_link_test():
         ("D", "기존 방식: request.images 중첩 구조",
          {"shop_no": 1, "request": {"images": {"detail_image": image_path, "list_image": image_path}}}),
     ]
-
-    attempts = []
-    api_url = f"{CAFE24_API_BASE}/products/{product_no}"
 
     for label, description, body in candidates:
         attempt = {"candidate": label, "description": description, "request_payload": body}
@@ -949,7 +1009,8 @@ def debug_product_link_test():
         "product_no": product_no,
         "image_path": image_path,
         "upload_step": upload_step,
-        "before": before,
+        "baseline_before_upload": baseline,
+        "before_put": before,
         "summary": {
             "working_candidate": winners[0]["candidate"] if winners else None,
             "working_description": winners[0]["description"] if winners else None,
@@ -1206,6 +1267,10 @@ def send_to_cafe24():
             if not os.path.isfile(local_path):
                 raise Exception(f"변환된 이미지 파일을 찾을 수 없습니다: {local_path}")
 
+            # 업로드가 실제로 대표이미지를 바꿨는지 판정하려면 "업로드 전" 값이 필요하다.
+            baseline_images = _get_product_image_fields(p_no)
+            logger.info(f"[송신 전 이미지 상태] product_no={p_no} {baseline_images}")
+
             with open(local_path, 'rb') as f:
                 encoded_image = base64.b64encode(f.read()).decode()
             ext = os.path.splitext(filename)[1].lower()
@@ -1239,25 +1304,37 @@ def send_to_cafe24():
                 fail_list.append({"product_no": p_no, "reason": img_err_msg})
                 continue
 
-            # POST /products/images는 파일을 몰의 이미지 저장소(/web/upload/NNEditor/...)에
-            # 올리고 그 경로만 돌려주는 "업로드" API다. 반환된 경로를 상품에 다시 연결하는
-            # PUT을 보내지 않으면 파일만 서버에 남고 상품 이미지는 그대로다 - 업로드는
-            # 201로 성공하는데 list_image가 안 바뀌던 원인.
             uploaded_path = _extract_uploaded_image_path(img_res_json)
             if not uploaded_path:
                 raise Exception(f"이미지 업로드 응답에서 path를 찾지 못했습니다: {img_res_json}")
             logger.info(f"[카페24 이미지 업로드 경로] product_no={p_no} path={uploaded_path}")
 
-            # [추가이미지] 조회 응답에서 추가이미지를 읽을 때 쓰는 필드명이 'additional_image'
-            # 이므로(위 search_products 참고) 쓰기도 같은 이름을 쓴다. 기존의
+            # [대표이미지 반영 확인] POST /products/images 요청에는 product_no가 포함되므로
+            # 이 API가 업로드와 상품 연결을 한 번에 처리한다. 실제로 연결용 PUT 후보
+            # 4종(image_upload_type/detail_image 조합, 중첩 구조 등)은 전부 반영되지
+            # 않았으므로 대표이미지를 PUT으로 다시 연결하지 않는다.
+            time.sleep(2)  # 카페24 반영 시차
+            after_upload = _get_product_image_fields(p_no)
+            representative_updated = (
+                bool(after_upload.get('list_image'))
+                and after_upload.get('list_image') != baseline_images.get('list_image')
+            )
+            logger.info(
+                f"[대표이미지 반영 확인] product_no={p_no} 반영여부={representative_updated} "
+                f"before={baseline_images.get('list_image')} after={after_upload.get('list_image')}"
+            )
+            if not representative_updated:
+                logger.error(
+                    f"[대표이미지 미반영] product_no={p_no} 업로드는 201로 성공했으나 "
+                    f"list_image가 그대로다. after={after_upload}"
+                )
+
+            # [추가이미지] 대표이미지와 달리 추가이미지는 PUT으로만 제어할 수 있다.
+            # 조회 응답에서 추가이미지를 읽을 때 쓰는 필드명이 'additional_image'이므로
+            # (위 search_products 참고) 쓰기도 같은 이름을 쓴다. 기존의
             # {"images": {"add_image": [...]}} 중첩 구조는 카페24가 모르는 필드라
             # 200을 반환하면서도 조용히 무시했을 가능성이 높다.
-            put_request = {
-                # 카페24 관리자 설정이 "대표이미지등록"이므로 원본 1장만 넘기면
-                # list/tiny/small은 카페24가 자동 리사이징한다.
-                "image_upload_type": "B",
-                "detail_image": uploaded_path,
-            }
+            put_request = {}
 
             if mode == 'model':
                 # [모델컷 모드] 추가이미지 일괄 삭제
@@ -1279,38 +1356,45 @@ def send_to_cafe24():
 
                 put_request["additional_image"] = processed_add_urls
 
-            api_url = f"{CAFE24_API_BASE}/products/{p_no}"
-            request_body = {"shop_no": 1, "request": put_request}
-            logger.info(f"[카페24 PUT 요청] product_no={p_no} url={api_url} payload={request_body}")
+            # 추가이미지 제어가 필요할 때만 PUT을 보낸다 (대표이미지는 위 업로드로 처리됨).
+            put_ok = True
+            put_error = None
+            if put_request:
+                api_url = f"{CAFE24_API_BASE}/products/{p_no}"
+                request_body = {"shop_no": 1, "request": put_request}
+                logger.info(f"[카페24 PUT 요청] product_no={p_no} url={api_url} payload={request_body}")
 
-            res = cafe24_api_request('PUT', api_url, json=request_body, timeout=15)
-            res_json = res.json()
-            logger.info(f"[카페24 응답] product_no={p_no} status={res.status_code} body={res_json}")
+                res = cafe24_api_request('PUT', api_url, json=request_body, timeout=15)
+                res_json = res.json()
+                logger.info(f"[카페24 응답] product_no={p_no} status={res.status_code} body={res_json}")
 
-            if res.status_code == 200:
-                success_list.append({"product_no": p_no, "url": f"/static/processed_images/{filename}"})
-
-                # 실제로 반영된 list_image를 카페24에 직접 재조회해서 검증한다.
-                # (이미지 등록 API 응답의 필드명을 확신할 수 없으므로, 항상 정확한
-                # 상품 리소스 GET을 기준으로 확인 - 검증 실패는 송신 성공/실패에 영향 없음)
-                try:
-                    verify_get = cafe24_api_request(
-                        'GET', f"{CAFE24_API_BASE}/products/{p_no}",
-                        params={"fields": "list_image,detail_image"}, timeout=10
-                    )
-                    verify_json = verify_get.json()
-                    logger.info(f"[카페24 상품 재조회 원문] product_no={p_no} body={verify_json}")
-                    verify_product = _extract_single_product(verify_json)
-                    current_list_image = verify_product.get('list_image') if verify_product else None
-                    logger.info(f"[카페24 현재 list_image 재조회] product_no={p_no} list_image={current_list_image}")
-                    if current_list_image:
-                        verify_image_dimensions(p_no, 'list_image', current_list_image)
-                except Exception as verify_err:
-                    logger.warning(f"[list_image 재조회 실패] product_no={p_no}: {verify_err}")
+                if res.status_code != 200:
+                    put_ok = False
+                    put_error = extract_cafe24_error_message(res_json)
+                    logger.error(f"카페24 추가이미지 갱신 실패 (product_no={p_no}): {put_error}")
             else:
-                err_msg = extract_cafe24_error_message(res_json)
-                logger.error(f"카페24 송신 실패 (product_no={p_no}): {err_msg}")
-                fail_list.append({"product_no": p_no, "reason": err_msg})
+                logger.info(f"[카페24 PUT 생략] product_no={p_no} 변경할 추가이미지 항목 없음")
+
+            if representative_updated and put_ok:
+                success_list.append({
+                    "product_no": p_no,
+                    "url": f"/static/processed_images/{filename}",
+                    "list_image": after_upload.get('list_image'),
+                })
+                # 반영된 이미지를 실제로 내려받아 1:1.4 비율인지까지 확인한다
+                # (진단 목적이며 송신 성공/실패 판정에는 영향 없음).
+                verify_image_dimensions(p_no, 'list_image', after_upload.get('list_image'))
+            else:
+                reasons = []
+                if not representative_updated:
+                    reasons.append(
+                        "대표이미지가 반영되지 않았습니다 (업로드는 201 성공, list_image 변화 없음)"
+                    )
+                if not put_ok:
+                    reasons.append(f"추가이미지 갱신 실패: {put_error}")
+                reason = " / ".join(reasons)
+                logger.error(f"카페24 송신 실패 (product_no={p_no}): {reason}")
+                fail_list.append({"product_no": p_no, "reason": reason})
 
         except Cafe24ReauthRequired as e:
             logger.error(f"카페24 재인증 필요, 송신 중단 (product_no={p_no}): {e}")

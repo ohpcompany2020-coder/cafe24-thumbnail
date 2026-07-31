@@ -858,6 +858,11 @@ def debug_image_register_test():
 # 바뀌었는지로 판정한다 (list_image 하나만 보면 detail_image만 바뀌는 경우를 놓친다).
 PRODUCT_IMAGE_FIELDS = ('detail_image', 'list_image', 'small_image', 'tiny_image')
 
+# PUT /products/{no}의 image_upload_type. 카페24 문서 기준 A=대표이미지등록,
+# B=개별이미지등록, C=웹FTP 등록. 우리는 웹FTP로 올린 파일 경로를 넘기므로 "C"를 쓴다.
+# (진단에서 F=C+detail_image, J=B+4종이 각각 반영 확인됨. 형식만 바꿔볼 수 있도록 상수로 둔다)
+CAFE24_IMAGE_UPLOAD_TYPE = os.getenv('CAFE24_IMAGE_UPLOAD_TYPE', 'C')
+
 
 def _changed_image_fields(before, after):
     """before 대비 after에서 새 값으로 바뀐 이미지 필드명 목록을 돌려준다."""
@@ -1434,7 +1439,24 @@ def search_products():
 # [1단계 API] 썸네일 변환 (미리보기 생성)
 @app.route('/api/convert', methods=['POST'])
 def convert_thumbnails():
-    """대표이미지와 추가이미지를 모두 같은 가공모드로 1000x1400 변환한다."""
+    """선택된 이미지(대표/추가)를 모두 같은 가공모드로 1000x1400 변환한다.
+
+    화면에서 체크 해제한 이미지는 아예 넘어오지 않으므로 변환하지 않는다.
+
+    JSON 구조 예시:
+    {
+      "mode": "product",
+      "products": [
+        {
+          "product_no": "676",
+          "images": [
+            {"key": "main",  "label": "대표",  "url": "https://.../a.jpg"},
+            {"key": "add_0", "label": "추가1", "url": "https://.../b.jpg"}
+          ]
+        }
+      ]
+    }
+    """
     data = request.json or {}
     mode = data.get('mode', 'product')  # 'product' -> 상하 여백 채우기 / 'model' -> 확대 후 중앙 가로 크롭
     products = data.get('products', [])
@@ -1442,52 +1464,54 @@ def convert_thumbnails():
 
     for item in products:
         p_no = item.get('product_no')
-        img_url = item.get('image_url')
-        filename = item.get('filename', f"{p_no}.jpg")
+        images = item.get('images', []) or []
+        image_results = []
 
-        try:
-            resp = fetch_image(img_url, timeout=10)
+        # 이미지 한 장이 실패해도 나머지 결과까지 버리지 않고 끝까지 진행한다.
+        for img in images:
+            key = str(img.get('key') or 'main')
+            label = img.get('label') or key
+            url = img.get('url')
 
-            output_file = process_image_bytes(resp.content, filename, mode)
-            preview_url = f"/static/processed_images/{output_file}"
+            try:
+                resp = fetch_image(url, timeout=10)
 
-            # 추가이미지도 대표이미지와 동일한 가공모드로 변환한다. 한 장이 실패해도
-            # 나머지와 대표이미지 결과까지 버리지 않고 계속 진행한다.
-            add_results = []
-            for idx, add_url in enumerate(item.get('add_images', []) or []):
-                add_source_name = os.path.basename((add_url or '').split('?')[0]) or f"{p_no}_add_{idx}.jpg"
-                add_ext = os.path.splitext(add_source_name)[1].lower() or '.jpg'
-                add_filename = f"{p_no}_add_{idx}{add_ext}"
-                try:
-                    add_resp = fetch_image(add_url, timeout=10)
-                    out_add_file = process_image_bytes(add_resp.content, add_filename, mode)
-                    add_results.append({
-                        "status": "SUCCESS",
-                        "source_url": add_url,
-                        "processed_filename": out_add_file,
-                        "preview_url": f"/static/processed_images/{out_add_file}",
-                    })
-                except Exception as add_err:
-                    logger.exception(f"추가이미지 변환 실패 (product_no={p_no} idx={idx} url={add_url})")
-                    add_results.append({
-                        "status": "FAIL",
-                        "source_url": add_url,
-                        "error": str(add_err),
-                    })
+                source_name = os.path.basename((url or '').split('?')[0])
+                ext = os.path.splitext(source_name)[1].lower() or '.jpg'
+                # 상품/이미지별로 파일명을 고정해 재변환 시 같은 파일을 덮어쓰게 한다
+                safe_key = re.sub(r'[^0-9A-Za-z_-]', '_', key)
+                out_file = process_image_bytes(resp.content, f"{p_no}_{safe_key}{ext}", mode)
 
-            results.append({
-                "product_no": p_no,
-                "status": "SUCCESS",
-                "preview_url": preview_url,
-                "processed_filename": output_file,
-                "add_results": add_results,
-                "processed_add_filenames": [
-                    r["processed_filename"] for r in add_results if r["status"] == "SUCCESS"
-                ],
-            })
-        except Exception as e:
-            logger.exception(f"상품 변환 실패 (product_no={p_no})")
-            results.append({"product_no": p_no, "status": "FAIL", "error": str(e)})
+                image_results.append({
+                    "key": key,
+                    "label": label,
+                    "status": "SUCCESS",
+                    "source_url": url,
+                    "processed_filename": out_file,
+                    "preview_url": f"/static/processed_images/{out_file}",
+                })
+            except Exception as e:
+                logger.exception(f"이미지 변환 실패 (product_no={p_no} key={key} url={url})")
+                image_results.append({
+                    "key": key,
+                    "label": label,
+                    "status": "FAIL",
+                    "source_url": url,
+                    "error": str(e),
+                })
+
+        success_count = sum(1 for r in image_results if r["status"] == "SUCCESS")
+        logger.info(
+            f"[변환] product_no={p_no} mode={mode} 요청 {len(images)}장 중 {success_count}장 성공"
+        )
+
+        results.append({
+            "product_no": p_no,
+            "status": "SUCCESS" if success_count else "FAIL",
+            "images": image_results,
+            "success_count": success_count,
+            "fail_count": len(image_results) - success_count,
+        })
 
     return jsonify({"success": True, "data": results})
 
@@ -1496,13 +1520,17 @@ def convert_thumbnails():
 def download_processed_images():
     """선택된 상품의 변환 결과(대표이미지 + 추가이미지)를 ZIP으로 묶어 반환한다.
 
+    체크 해제된 이미지는 items[].images에 담기지 않으므로 ZIP에도 포함되지 않는다.
+
     JSON 구조 예시:
     {
       "items": [
         {
           "product_code": "P0000ABC",
-          "processed_filename": "processed_10.jpg",
-          "processed_add_filenames": ["processed_10_add_0.jpg"]
+          "images": [
+            {"label": "대표",  "filename": "processed_676_main.jpg"},
+            {"label": "추가1", "filename": "processed_676_add_0.jpg"}
+          ]
         }
       ]
     }
@@ -1523,14 +1551,14 @@ def download_processed_images():
             raw_code = str(item.get('product_code') or item.get('product_no') or 'unknown')
             folder = re.sub(r'[^0-9A-Za-z가-힣._-]', '_', raw_code) or 'unknown'
 
-            entries = []
-            main_file = item.get('processed_filename')
-            if main_file:
-                entries.append(('대표이미지', main_file))
-            for idx, add_file in enumerate(item.get('processed_add_filenames', []) or [], start=1):
-                entries.append((f'추가이미지{idx}', add_file))
+            entries = [
+                (img.get('label') or f'이미지{idx}', img.get('filename'))
+                for idx, img in enumerate(item.get('images', []) or [], start=1)
+                if img.get('filename')
+            ]
 
             for label, stored_name in entries:
+                label = re.sub(r'[^0-9A-Za-z가-힣._-]', '_', str(label)) or '이미지'
                 stored_name = os.path.basename(stored_name)
                 source_path = os.path.join(UPLOAD_FOLDER, stored_name)
                 if not os.path.isfile(source_path):
@@ -1568,15 +1596,22 @@ def download_processed_images():
 # [2단계 API] FTP 업로드 & 카페24 전송
 @app.route('/api/send-cafe24', methods=['POST'])
 def send_to_cafe24():
-    """대표이미지와 추가이미지를 모두 갱신한다 (가공모드에 따른 삭제 분기 없음).
+    """체크된 이미지만 카페24에 반영한다.
+
+    - 대표이미지가 없으면(체크 해제) detail/list/small/tiny 4종을 요청에서 아예 빼서
+      기존 값이 그대로 유지되게 한다. 대표이미지는 "삭제" 개념이 없다.
+    - 추가이미지는 보낸 배열로 통째로 교체되므로, 체크 해제된 것은 자연히 삭제된다.
+    - 단, 애초에 추가이미지가 없는 상품(has_additional_images=false)에는 필드 자체를
+      넣지 않는다. 빈 배열을 보내면 기존 이미지가 지워지기 때문이다.
 
     JSON 구조 예시:
     {
       "items": [
          {
            "product_no": "10",
-           "processed_filename": "processed_10.jpg",            // 1단계에서 변환된 대표이미지
-           "processed_add_filenames": ["processed_10_add_0.jpg"] // 1단계에서 변환된 추가이미지
+           "main_filename": "processed_10_main.jpg",       // 대표 체크 해제 시 null
+           "add_filenames": ["processed_10_add_0.jpg"],    // 체크된 추가이미지만
+           "has_additional_images": true                    // 상품에 추가이미지가 존재하는지
          }
       ]
     }
@@ -1589,68 +1624,83 @@ def send_to_cafe24():
 
     for item in items:
         p_no = item.get('product_no')
-        filename = item.get('processed_filename')
-        local_path = os.path.join(UPLOAD_FOLDER, filename)
+        main_filename = item.get('main_filename')
+        add_filenames = item.get('add_filenames', []) or []
+        has_additional_images = bool(item.get('has_additional_images'))
 
         try:
-            # [대표이미지 등록 방식 - /api/debug/product-link-test 진단으로 확정]
+            # [반영 방식 - /api/debug/product-link-test 진단으로 확정]
             #   - POST /products/images(base64)는 201로 성공하지만 파일을 상세페이지
             #     에디터 저장소(/web/upload/NNEditor/)에 올릴 뿐 상품에 연결하지 않는다.
             #   - 상품 썸네일은 /web/product/big|medium|small|tiny/ 에 있어야 하므로
             #     NNEditor 경로를 PUT에 넣으면 "Wrong image path"가 난다.
             #   - 웹FTP로 /web/upload/thumbnail/에 올린 뒤 그 경로를 PUT에 넘기면
             #     카페24가 /web/product/... 로 옮겨 담아 실제로 반영된다.
-            # 후보 J(image_upload_type="B" + 4종 전부 지정)가 list/small/tiny까지
-            # 한 번에 갱신해서 가장 완전했으므로 그 형식을 사용한다.
-            if not os.path.isfile(local_path):
-                raise Exception(f"변환된 이미지 파일을 찾을 수 없습니다: {local_path}")
+            if not main_filename and not has_additional_images:
+                logger.info(f"[송신 건너뜀] product_no={p_no} 반영할 이미지가 없음")
+                fail_list.append({"product_no": p_no, "reason": "선택된 이미지가 없습니다."})
+                continue
 
             # 반영 여부를 판정하려면 "변경 전" 값이 필요하다.
             baseline_images = _get_product_image_fields(p_no)
-            logger.info(f"[송신 전 이미지 상태] product_no={p_no} {baseline_images}")
+            logger.info(
+                f"[송신 전 이미지 상태] product_no={p_no} {baseline_images} "
+                f"대표={'포함' if main_filename else '유지(체크 해제)'} "
+                f"추가이미지={len(add_filenames)}장 (상품 보유여부={has_additional_images})"
+            )
 
-            # 1. 웹FTP 업로드 (image_upload_type="B"/"C"가 참조할 실제 파일)
             remote_dir = '/web/upload/thumbnail/'
-            ftp_url = upload_to_ftp(local_path, filename, remote_dir=remote_dir)
-            ftp_path = f"{remote_dir}{filename}"
-            logger.info(f"[FTP 업로드 완료] product_no={p_no} url={ftp_url} PUT 전달 경로={ftp_path}")
+            put_request = {"image_upload_type": CAFE24_IMAGE_UPLOAD_TYPE}
 
-            # 2. 대표이미지 4종을 모두 방금 올린 경로로 지정 (카페24가 크기별로 리사이징한다)
-            put_request = {
-                "image_upload_type": "B",
-                "detail_image": ftp_path,
-                "list_image": ftp_path,
-                "small_image": ftp_path,
-                "tiny_image": ftp_path,
-            }
+            # 1. 대표이미지: 체크됐을 때만 FTP 업로드 후 4종 필드에 지정한다.
+            #    체크 해제 시에는 필드를 아예 넣지 않아 기존 값이 유지된다.
+            if main_filename:
+                main_filename = os.path.basename(main_filename)
+                local_path = os.path.join(UPLOAD_FOLDER, main_filename)
+                if not os.path.isfile(local_path):
+                    raise Exception(f"변환된 대표이미지 파일을 찾을 수 없습니다: {local_path}")
 
-            # [추가이미지] 조회 응답에서 추가이미지를 읽을 때 쓰는 필드명이
-            # 'additional_image'이므로(위 search_products 참고) 쓰기도 같은 이름을 쓴다.
-            # 기존의 {"images": {"add_image": [...]}} 중첩 구조는 카페24가 모르는 필드라
-            # 200을 반환하면서도 조용히 무시했다.
-            #
-            # 가공모드(제품컷/모델컷)에 따라 추가이미지를 삭제하던 분기는 제거했다.
-            # 대표이미지든 추가이미지든 같은 가공모드로 변환해 전부 갱신만 한다.
-            # additional_image는 "보낸 목록으로 통째로 교체"되는 필드라, 올릴 이미지가
-            # 없을 때 빈 배열을 보내면 기존 추가이미지가 전부 지워진다. 그래서 올릴
-            # 이미지가 있을 때만 필드를 넣는다 (어떤 경우에도 삭제하지 않는다).
+                ftp_url = upload_to_ftp(local_path, main_filename, remote_dir=remote_dir)
+                ftp_path = f"{remote_dir}{main_filename}"
+                logger.info(f"[FTP 업로드 완료-대표] product_no={p_no} url={ftp_url} PUT 전달 경로={ftp_path}")
+
+                # 4종을 모두 방금 올린 경로로 지정 (카페24가 크기별로 리사이징한다)
+                put_request.update({
+                    "detail_image": ftp_path,
+                    "list_image": ftp_path,
+                    "small_image": ftp_path,
+                    "tiny_image": ftp_path,
+                })
+            else:
+                logger.info(f"[대표이미지 유지] product_no={p_no} 체크 해제되어 4종 필드를 보내지 않음")
+
+            # 2. 추가이미지: 조회 응답에서 읽을 때 쓰는 필드명이 'additional_image'이므로
+            #    (위 search_products 참고) 쓰기도 같은 이름을 쓴다.
+            #    이 필드는 "보낸 목록으로 통째로 교체"되므로 체크 해제된 것은 삭제된다.
             processed_add_urls = []
-            for add_filename in item.get('processed_add_filenames', []) or []:
-                add_local_path = os.path.join(UPLOAD_FOLDER, os.path.basename(add_filename))
+            for add_filename in add_filenames:
+                add_filename = os.path.basename(add_filename)
+                add_local_path = os.path.join(UPLOAD_FOLDER, add_filename)
                 if not os.path.isfile(add_local_path):
                     logger.warning(f"[추가이미지 건너뜀] product_no={p_no} 파일 없음: {add_local_path}")
                     continue
 
-                upload_to_ftp(add_local_path, os.path.basename(add_filename), remote_dir=remote_dir)
+                upload_to_ftp(add_local_path, add_filename, remote_dir=remote_dir)
                 # 대표이미지와 동일하게 "http:// 절대URL"이 아니라 웹FTP 경로를 넘긴다
                 # (절대URL 형태는 대표이미지에서 Wrong image path로 거부됐다).
-                processed_add_urls.append(f"{remote_dir}{os.path.basename(add_filename)}")
+                processed_add_urls.append(f"{remote_dir}{add_filename}")
 
-            if processed_add_urls:
+            if has_additional_images:
+                # 상품이 추가이미지를 가진 경우에만 필드를 보낸다. 빈 배열이면 전체 삭제가
+                # 되지만, 이는 사용자가 모든 추가이미지를 체크 해제한 의도적 결과다.
                 put_request["additional_image"] = processed_add_urls
-                logger.info(f"[추가이미지 갱신] product_no={p_no} {len(processed_add_urls)}건 {processed_add_urls}")
+                logger.info(
+                    f"[추가이미지 반영] product_no={p_no} {len(processed_add_urls)}장 전송 "
+                    f"{processed_add_urls}"
+                )
             else:
-                logger.info(f"[추가이미지 유지] product_no={p_no} 갱신할 추가이미지가 없어 필드를 보내지 않음")
+                # 추가이미지가 없는 상품에는 필드 자체를 넣지 않는다 (실수로 지우지 않도록).
+                logger.info(f"[추가이미지 필드 생략] product_no={p_no} 상품에 추가이미지가 없음")
 
             api_url = f"{CAFE24_API_BASE}/products/{p_no}"
             request_body = {"shop_no": 1, "request": put_request}
@@ -1680,30 +1730,36 @@ def send_to_cafe24():
                 current_images = after_images
 
             logger.info(
-                f"[대표이미지 반영 확인] product_no={p_no} 바뀐필드={changed_fields} "
+                f"[반영 확인] product_no={p_no} 바뀐필드={changed_fields} "
                 f"before={ {f: baseline_images.get(f) for f in PRODUCT_IMAGE_FIELDS} } "
                 f"after={ {f: current_images.get(f) for f in PRODUCT_IMAGE_FIELDS} }"
             )
 
-            if changed_fields:
-                success_list.append({
-                    "product_no": p_no,
-                    "url": f"/static/processed_images/{filename}",
-                    "changed_fields": changed_fields,
-                    "list_image": current_images.get('list_image'),
-                })
-                # 반영된 이미지를 실제로 내려받아 1:1.4 비율인지까지 확인한다
-                # (진단 목적이며 송신 성공/실패 판정에는 영향 없음).
-                verify_target = current_images.get('list_image') or current_images.get('detail_image')
-                if verify_target:
-                    verify_image_dimensions(p_no, 'list_image', verify_target)
-            else:
+            # 대표이미지를 보내지 않은 경우에는 4종 필드가 그대로인 것이 정상이므로
+            # 변화 여부로 성공을 판정할 수 없다. 이때는 PUT 200을 성공으로 본다.
+            if main_filename and not changed_fields:
                 reason = (
                     "PUT은 200이지만 이미지 4종(detail/list/small/tiny) 중 어느 것도 "
                     "새 경로로 바뀌지 않았습니다."
                 )
                 logger.error(f"카페24 송신 실패 (product_no={p_no}): {reason} 응답={res_json}")
                 fail_list.append({"product_no": p_no, "reason": reason})
+                continue
+
+            success_list.append({
+                "product_no": p_no,
+                "main_updated": bool(main_filename),
+                "additional_sent": len(processed_add_urls) if has_additional_images else None,
+                "changed_fields": changed_fields,
+                "list_image": current_images.get('list_image'),
+            })
+
+            if main_filename:
+                # 반영된 이미지를 실제로 내려받아 1:1.4 비율인지까지 확인한다
+                # (진단 목적이며 송신 성공/실패 판정에는 영향 없음).
+                verify_target = current_images.get('list_image') or current_images.get('detail_image')
+                if verify_target:
+                    verify_image_dimensions(p_no, 'list_image', verify_target)
 
         except Cafe24ReauthRequired as e:
             logger.error(f"카페24 재인증 필요, 송신 중단 (product_no={p_no}): {e}")

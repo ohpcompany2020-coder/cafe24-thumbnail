@@ -119,11 +119,9 @@
                 <thead class="bg-slate-100 text-slate-700 font-semibold border-b border-slate-200">
                     <tr>
                         <th class="p-4 w-12 text-center">선택</th>
-                        <th class="p-4 w-16 text-center">No.</th>
-                        <th class="p-4 w-28 text-center">원본 (1:1)</th>
-                        <th class="p-4 w-28 text-center bg-indigo-50/50 text-indigo-900">변환 후 (1:1.4)</th>
-                        <th class="p-4">상품명 / 상품코드</th>
-                        <th class="p-4 w-24 text-center">포맷</th>
+                        <th class="p-4 w-14 text-center">No.</th>
+                        <th class="p-4 w-56">상품명 / 상품코드</th>
+                        <th class="p-4">이미지 (원본 → 변환 후) · 체크된 것만 변환/송신</th>
                         <th class="p-4 w-32 text-center">진행 단계</th>
                         <th class="p-4 w-24 text-center">다운로드</th>
                     </tr>
@@ -172,10 +170,11 @@
         //   image_url,      // 원본(1:1) 이미지 URL - /api/convert 호출 시 서버가 다운로드하는 소스
         //   filename,       // 원본 파일명(확장자 포함, GIF 포함)
         //   format,         // 'JPG' | 'PNG' | 'GIF' 등 표시용
-        //   add_images,     // 추가이미지 원본 URL 목록 (대표이미지와 같은 가공모드로 함께 변환됨)
-        //   preview_url,    // /api/convert 성공 후 채워지는 변환본 미리보기 URL
-        //   processed_filename,      // /api/convert 성공 후 채워지는 서버측 가공 파일명 (send-cafe24에 그대로 재사용)
-        //   processed_add_filenames, // 변환된 추가이미지 파일명 목록 (송신/다운로드에 재사용)
+        //   add_images,     // 추가이미지 원본 URL 목록 (buildImageList로 images에 합쳐짐)
+        //   images,         // 대표+추가 이미지 목록. 각 항목:
+        //                   //   { key: 'main'|'add_0'..., label: '대표'|'추가1'...,
+        //                   //     source_url, checked, preview_url, processed_filename, convert_error }
+        //                   //   checked=false인 이미지는 변환/송신/다운로드에서 모두 제외된다
         //   status          // 화면 "진행 단계" 컬럼에 표시할 텍스트
         // }
         let productsData = [];
@@ -294,9 +293,7 @@
 
                     productsData.push(...(json.data || []).map(p => ({
                         ...p,
-                        preview_url: null,
-                        processed_filename: null,
-                        processed_add_filenames: [],
+                        images: buildImageList(p),
                         status: '조회 완료'
                     })));
 
@@ -333,6 +330,43 @@
                 searchBtn.disabled = false;
                 searchBtn.classList.remove('opacity-50', 'cursor-not-allowed');
             }
+        }
+
+        // 상품의 대표이미지 + 추가이미지를 하나의 목록으로 만든다.
+        // 각 이미지는 개별 체크박스를 가지며 기본값은 전부 체크된 상태다.
+        function buildImageList(product) {
+            const images = [{
+                key: 'main',
+                label: '대표',
+                source_url: product.image_url,
+                checked: true,
+                preview_url: null,
+                processed_filename: null,
+                convert_error: null
+            }];
+
+            (product.add_images || []).forEach((url, idx) => {
+                images.push({
+                    key: `add_${idx}`,
+                    label: `추가${idx + 1}`,
+                    source_url: url,
+                    checked: true,
+                    preview_url: null,
+                    processed_filename: null,
+                    convert_error: null
+                });
+            });
+
+            return images;
+        }
+
+        function getCheckedImages(product) {
+            return (product.images || []).filter(img => img.checked);
+        }
+
+        // 체크되어 있고 변환까지 끝난 이미지 (송신/다운로드 대상)
+        function getSendableImages(product) {
+            return (product.images || []).filter(img => img.checked && img.processed_filename);
         }
 
         // ==========================================
@@ -372,6 +406,7 @@
                 '조회 완료': 'bg-slate-100 text-slate-500',
                 '변환 중...': 'bg-amber-100 text-amber-700',
                 '변환 완료': 'bg-emerald-100 text-emerald-700',
+                '일부 변환 실패': 'bg-orange-100 text-orange-700',
                 '변환 실패': 'bg-red-100 text-red-700',
                 '송신 중...': 'bg-amber-100 text-amber-700',
                 '송신 완료': 'bg-indigo-100 text-indigo-700',
@@ -381,13 +416,12 @@
             return `<span class="px-2 py-1 ${cls} rounded text-xs font-medium">${statusText}</span>`;
         }
 
-        function updatePreviewImage(productNo, previewUrl) {
-            const cell = document.getElementById(`preview-cell-${productNo}`);
+        // 이미지 1장의 변환 결과 미리보기 칸만 갱신한다.
+        // (renderPreviewBox가 캐시 무효화용 타임스탬프를 붙이므로 재변환 시에도 즉시 반영됨)
+        function updatePreviewCell(productNo, img) {
+            const cell = document.getElementById(`preview-${productNo}-${img.key}`);
             if (!cell) return;
-            // 캐시 무효화용 타임스탬프를 붙여 재변환 시 최신 이미지가 즉시 반영되도록 함
-            // (GIF도 <img> 태그로 그대로 로드하면 브라우저가 애니메이션을 자동 재생함)
-            cell.innerHTML = `<img src="${previewUrl}?t=${Date.now()}" alt="변환 미리보기"
-                class="w-16 h-[89.6px] object-cover rounded border border-indigo-200 mx-auto bg-white">`;
+            cell.innerHTML = renderPreviewBox(img);
         }
 
         // ==========================================
@@ -432,7 +466,7 @@
             if (productsData.length === 0) {
                 tbody.innerHTML = `
                     <tr>
-                        <td colspan="8" class="p-6 text-center text-sm text-slate-400">
+                        <td colspan="6" class="p-6 text-center text-sm text-slate-400">
                             상단 검색창에서 모델명을 입력 후 조회해 주세요
                         </td>
                     </tr>`;
@@ -440,28 +474,23 @@
             }
 
             tbody.innerHTML = productsData.map((p, idx) => `
-                <tr class="hover:bg-slate-50" id="row-${p.product_no}">
+                <tr class="hover:bg-slate-50 align-top" id="row-${p.product_no}">
                     <td class="p-4 text-center">
                         <input type="checkbox" class="product-check w-4 h-4 rounded" data-product-no="${p.product_no}">
                     </td>
                     <td class="p-4 text-center font-mono text-xs text-slate-400">${idx + 1}</td>
-                    <td class="p-4 text-center">
-                        <img src="${p.image_url}" alt="원본"
-                            class="w-16 h-16 object-cover rounded border border-slate-200 mx-auto bg-slate-100">
-                    </td>
-                    <td class="p-4 text-center bg-indigo-50/30" id="preview-cell-${p.product_no}">
-                        ${p.preview_url
-                            ? `<img src="${p.preview_url}?t=${Date.now()}" alt="변환 미리보기" class="w-16 h-[89.6px] object-cover rounded border border-indigo-200 mx-auto bg-white">`
-                            : `<div class="w-16 h-[89.6px] bg-indigo-100/50 border border-indigo-200 rounded mx-auto flex items-center justify-center text-[10px] text-indigo-400 font-mono">미변환</div>`}
-                    </td>
                     <td class="p-4">
                         <div class="font-semibold text-slate-800">${p.product_name}</div>
                         <div class="text-xs text-slate-400 mt-0.5">${p.product_code}</div>
-                        ${(p.add_images && p.add_images.length)
-                            ? `<div class="text-[11px] text-slate-400 mt-1">추가이미지 ${p.add_images.length}장 포함</div>`
-                            : ''}
+                        <div class="text-[11px] text-slate-400 mt-1">
+                            이미지 ${p.images.length}장 (추가 ${p.images.length - 1}장)
+                        </div>
                     </td>
-                    <td class="p-4 text-center"><span class="px-2 py-1 bg-slate-100 text-slate-600 rounded text-xs font-mono">${p.format}</span></td>
+                    <td class="p-3">
+                        <div class="flex flex-wrap gap-3">
+                            ${p.images.map(img => renderImageCard(p, img)).join('')}
+                        </div>
+                    </td>
                     <td class="p-4 text-center" id="status-cell-${p.product_no}">${statusBadge(p.status)}</td>
                     <td class="p-4 text-center">
                         <button onclick="downloadProduct('${p.product_no}')"
@@ -471,6 +500,61 @@
                     </td>
                 </tr>
             `).join('');
+        }
+
+        // 이미지 1장 카드: 체크박스 + 라벨 + 원본 썸네일 + 변환 결과 미리보기
+        function renderImageCard(product, img) {
+            const cellId = `preview-${product.product_no}-${img.key}`;
+            const isMain = img.key === 'main';
+            const labelClass = isMain
+                ? 'bg-indigo-100 text-indigo-700 border-indigo-200'
+                : 'bg-slate-100 text-slate-600 border-slate-200';
+
+            return `
+                <div class="border ${img.checked ? 'border-slate-200' : 'border-dashed border-slate-300 opacity-50'} rounded-lg p-2 bg-white"
+                     id="card-${product.product_no}-${img.key}">
+                    <label class="flex items-center gap-1.5 cursor-pointer mb-1.5">
+                        <input type="checkbox" class="image-check w-3.5 h-3.5 rounded"
+                            data-product-no="${product.product_no}" data-key="${img.key}"
+                            ${img.checked ? 'checked' : ''}
+                            onchange="toggleImageChecked('${product.product_no}', '${img.key}', this.checked)">
+                        <span class="px-1.5 py-0.5 border ${labelClass} rounded text-[10px] font-bold">${img.label}</span>
+                    </label>
+                    <div class="flex items-end gap-1">
+                        <img src="${img.source_url}" alt="${img.label} 원본"
+                            class="w-14 h-14 object-cover rounded border border-slate-200 bg-slate-100">
+                        <span class="text-slate-300 text-xs pb-5">→</span>
+                        <div id="${cellId}">${renderPreviewBox(img)}</div>
+                    </div>
+                </div>`;
+        }
+
+        function renderPreviewBox(img) {
+            if (img.preview_url) {
+                return `<img src="${img.preview_url}?t=${Date.now()}" alt="변환 결과"
+                    class="w-14 h-[78.4px] object-cover rounded border border-indigo-200 bg-white">`;
+            }
+            if (img.convert_error) {
+                return `<div class="w-14 h-[78.4px] bg-red-50 border border-red-200 rounded flex items-center justify-center text-[9px] text-red-500 text-center px-0.5">변환<br>실패</div>`;
+            }
+            return `<div class="w-14 h-[78.4px] bg-indigo-100/50 border border-indigo-200 rounded flex items-center justify-center text-[9px] text-indigo-400 font-mono">미변환</div>`;
+        }
+
+        // 이미지 체크 상태 변경 - 상태만 갱신하고 카드 테두리만 바꾼다 (전체 재렌더 방지)
+        function toggleImageChecked(productNo, key, checked) {
+            const product = findProduct(productNo);
+            if (!product) return;
+
+            const img = product.images.find(i => i.key === key);
+            if (img) img.checked = checked;
+
+            const card = document.getElementById(`card-${productNo}-${key}`);
+            if (card) {
+                card.classList.toggle('border-dashed', !checked);
+                card.classList.toggle('border-slate-300', !checked);
+                card.classList.toggle('opacity-50', !checked);
+                card.classList.toggle('border-slate-200', checked);
+            }
         }
 
         // ==========================================
@@ -492,6 +576,16 @@
             setProgress(done, selected.length, '1단계: 썸네일 이미지 변환 중...');
 
             for (const product of selected) {
+                // 체크된 이미지만 변환 대상. 체크 해제된 것은 서버로 보내지 않는다.
+                const targetImages = getCheckedImages(product);
+                if (targetImages.length === 0) {
+                    setProductStatus(product.product_no, '변환 실패');
+                    console.warn(`[변환 건너뜀] ${product.product_no}: 체크된 이미지가 없습니다.`);
+                    done++;
+                    setProgress(done, selected.length, '1단계: 썸네일 이미지 변환 중...');
+                    continue;
+                }
+
                 setProductStatus(product.product_no, '변환 중...');
                 try {
                     const res = await fetch('/api/convert', {
@@ -501,31 +595,44 @@
                             mode: mode,
                             products: [{
                                 product_no: product.product_no,
-                                image_url: product.image_url,
-                                filename: product.filename,
-                                // 추가이미지도 대표이미지와 같은 가공모드로 함께 변환한다
-                                add_images: product.add_images || []
+                                images: targetImages.map(img => ({
+                                    key: img.key,
+                                    label: img.label,
+                                    url: img.source_url
+                                }))
                             }]
                         })
                     });
                     const json = await res.json();
                     const result = (json.data || [])[0];
+                    const imageResults = (result && result.images) || [];
 
-                    if (result && result.status === 'SUCCESS') {
-                        product.preview_url = result.preview_url;
-                        product.processed_filename = result.processed_filename;
-                        product.processed_add_filenames = result.processed_add_filenames || [];
-                        product.add_results = result.add_results || [];
+                    // 이미지별 결과를 각 카드에 반영
+                    imageResults.forEach(r => {
+                        const img = product.images.find(i => i.key === r.key);
+                        if (!img) return;
 
-                        const addFailed = (result.add_results || []).filter(r => r.status === 'FAIL').length;
-                        updatePreviewImage(product.product_no, result.preview_url);
-                        setProductStatus(product.product_no, '변환 완료');
-                        if (addFailed > 0) {
-                            console.warn(`[추가이미지 일부 실패] ${product.product_no}: ${addFailed}건`);
+                        if (r.status === 'SUCCESS') {
+                            img.preview_url = r.preview_url;
+                            img.processed_filename = r.processed_filename;
+                            img.convert_error = null;
+                        } else {
+                            img.preview_url = null;
+                            img.processed_filename = null;
+                            img.convert_error = r.error || '변환 실패';
+                            console.error(`[변환 실패] ${product.product_no} ${r.label}:`, r.error);
                         }
+                        updatePreviewCell(product.product_no, img);
+                    });
+
+                    const failCount = (result && result.fail_count) || 0;
+                    if (result && result.status === 'SUCCESS') {
+                        setProductStatus(
+                            product.product_no,
+                            failCount > 0 ? '일부 변환 실패' : '변환 완료'
+                        );
                     } else {
                         setProductStatus(product.product_no, '변환 실패');
-                        console.error(`[변환 실패] ${product.product_no}:`, result && result.error);
                     }
                 } catch (e) {
                     setProductStatus(product.product_no, '변환 실패');
@@ -551,17 +658,50 @@
                 return;
             }
 
-            const targets = selected.filter(p => p.processed_filename);
+            const targets = selected.filter(p => getSendableImages(p).length > 0);
             const skipped = selected.length - targets.length;
             if (targets.length === 0) {
-                alert('선택한 상품이 아직 변환되지 않았습니다. 먼저 [1단계: 변환실행]을 진행해 주세요.');
+                alert('선택한 상품에 송신할 변환 결과가 없습니다. 먼저 [1단계: 변환실행]을 진행해 주세요.');
                 return;
             }
             if (skipped > 0) {
-                alert(`변환되지 않은 ${skipped}건은 이번 송신에서 제외됩니다. 먼저 [1단계: 변환실행]을 진행해 주세요.`);
+                alert(`변환된 이미지가 없는 ${skipped}건은 이번 송신에서 제외됩니다.`);
+            }
+
+            // 체크 해제된 추가이미지는 additional_image 배열에서 빠지므로 카페24에서 삭제된다.
+            // 실수로 지우는 일이 없도록 송신 전에 반드시 확인받는다.
+            const deletionCount = targets.reduce((sum, p) => {
+                const addImages = (p.images || []).filter(i => i.key !== 'main');
+                return sum + addImages.filter(i => !i.checked).length;
+            }, 0);
+
+            if (deletionCount > 0) {
+                const ok = confirm(
+                    `선택 해제된 추가이미지 ${deletionCount}개는 카페24에서 삭제됩니다. 계속하시겠습니까?`
+                );
+                if (!ok) return;
             }
 
             await sendItemsToCafe24(targets);
+        }
+
+        // 송신 요청 1건 구성.
+        // - 대표이미지가 체크 해제되면 main_filename을 보내지 않아 기존 값이 유지된다.
+        // - has_additional_images는 "상품이 원래 추가이미지를 가지고 있는지"다. false면
+        //   서버가 additional_image 필드 자체를 보내지 않아 실수로 지우는 일을 막는다.
+        function buildSendItem(product) {
+            const images = product.images || [];
+            const mainImage = images.find(i => i.key === 'main');
+            const addImages = images.filter(i => i.key !== 'main');
+
+            return {
+                product_no: product.product_no,
+                main_filename: (mainImage && mainImage.checked) ? mainImage.processed_filename : null,
+                add_filenames: addImages
+                    .filter(i => i.checked && i.processed_filename)
+                    .map(i => i.processed_filename),
+                has_additional_images: addImages.length > 0
+            };
         }
 
         async function sendItemsToCafe24(targets) {
@@ -580,13 +720,7 @@
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
-                            items: [{
-                                product_no: product.product_no,
-                                processed_filename: product.processed_filename,
-                                // 대표이미지/추가이미지 모두 1단계에서 같은 가공모드로 변환된
-                                // 파일을 그대로 반영한다 (가공모드에 따른 삭제 분기 없음).
-                                processed_add_filenames: product.processed_add_filenames || []
-                            }]
+                            items: [buildSendItem(product)]
                         })
                     });
                     const json = await res.json();
@@ -627,12 +761,15 @@
         // ==========================================
         // 변환 결과 다운로드 (POST /api/download -> ZIP)
         // ==========================================
+        // 체크되어 있고 변환까지 끝난 이미지만 ZIP에 담는다 (라벨을 파일명에 씀)
         function toDownloadItem(product) {
             return {
                 product_code: product.product_code || product.product_no,
                 product_no: product.product_no,
-                processed_filename: product.processed_filename,
-                processed_add_filenames: product.processed_add_filenames || []
+                images: getSendableImages(product).map(img => ({
+                    label: img.label,
+                    filename: img.processed_filename
+                }))
             };
         }
 
@@ -686,8 +823,8 @@
             const product = findProduct(productNo);
             if (!product) return;
 
-            if (!product.processed_filename) {
-                alert('아직 변환되지 않은 상품입니다. 먼저 [1단계: 변환실행]을 진행해 주세요.');
+            if (getSendableImages(product).length === 0) {
+                alert('체크된 이미지 중 변환된 것이 없습니다. 먼저 [1단계: 변환실행]을 진행해 주세요.');
                 return;
             }
             await downloadItems([toDownloadItem(product)]);
@@ -701,14 +838,14 @@
                 return;
             }
 
-            const targets = selected.filter(p => p.processed_filename);
+            const targets = selected.filter(p => getSendableImages(p).length > 0);
             const skipped = selected.length - targets.length;
             if (targets.length === 0) {
-                alert('선택한 상품이 아직 변환되지 않았습니다. 먼저 [1단계: 변환실행]을 진행해 주세요.');
+                alert('선택한 상품에 변환된 이미지가 없습니다. 먼저 [1단계: 변환실행]을 진행해 주세요.');
                 return;
             }
             if (skipped > 0) {
-                alert(`변환되지 않은 ${skipped}건은 이번 다운로드에서 제외됩니다.`);
+                alert(`변환된 이미지가 없는 ${skipped}건은 이번 다운로드에서 제외됩니다.`);
             }
 
             await downloadItems(targets.map(toDownloadItem));
@@ -750,7 +887,7 @@
             const checkedNos = Array.from(document.querySelectorAll('.fail-check:checked'))
                 .map(cb => cb.dataset.productNo);
             const retryTargets = productsData.filter(
-                p => checkedNos.includes(p.product_no) && p.processed_filename
+                p => checkedNos.includes(p.product_no) && getSendableImages(p).length > 0
             );
 
             if (retryTargets.length === 0) {

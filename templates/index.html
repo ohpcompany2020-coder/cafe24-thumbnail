@@ -72,13 +72,18 @@
                     </select>
 
                     <select id="sortOrder" onchange="searchProducts()" class="px-3 py-1.5 border border-slate-300 rounded-lg text-sm text-slate-600 focus:outline-none">
-                        <option value="asc">등록순</option>
-                        <option value="desc" selected>등록역순</option>
+                        <option value="asc" selected>등록순</option>
+                        <option value="desc">등록역순</option>
                     </select>
 
                     <!-- [1단계] 변환실행 버튼 -->
                     <button id="convertBtn" onclick="runConvert()" class="px-5 py-2.5 bg-slate-800 hover:bg-slate-900 text-white font-bold text-sm rounded-lg transition-all shadow-sm flex items-center gap-2">
                         <span>🎨</span> <span>1단계: 변환실행</span>
+                    </button>
+
+                    <!-- 변환 결과 다운로드 버튼 (선택된 상품 전체) -->
+                    <button id="downloadBtn" onclick="downloadSelected()" class="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-sm rounded-lg transition-all shadow-sm flex items-center gap-2">
+                        <span>⬇️</span> <span>다운로드</span>
                     </button>
 
                     <!-- [2단계] 카페24 송신 버튼 -->
@@ -102,6 +107,11 @@
 
         <!-- 3. 상품 목록 표 (변환 전 vs 변환 후 이미지 리스트 표시) -->
         <section class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+            <!-- 조회 결과 요약 (총 상품수) -->
+            <div class="px-5 py-3 border-b border-slate-200 bg-slate-50/70 flex flex-wrap items-center gap-x-3 gap-y-1">
+                <span class="text-sm font-bold text-slate-800">총 상품수: <span id="totalCount">0</span>건</span>
+                <span id="filterNote" class="text-xs text-slate-500"></span>
+            </div>
             <table class="w-full text-left text-sm text-slate-600">
                 <thead class="bg-slate-100 text-slate-700 font-semibold border-b border-slate-200">
                     <tr>
@@ -112,6 +122,7 @@
                         <th class="p-4">상품명 / 상품코드</th>
                         <th class="p-4 w-24 text-center">포맷</th>
                         <th class="p-4 w-32 text-center">진행 단계</th>
+                        <th class="p-4 w-24 text-center">다운로드</th>
                     </tr>
                 </thead>
                 <tbody id="productTableBody" class="divide-y divide-slate-100">
@@ -158,9 +169,10 @@
         //   image_url,      // 원본(1:1) 이미지 URL - /api/convert 호출 시 서버가 다운로드하는 소스
         //   filename,       // 원본 파일명(확장자 포함, GIF 포함)
         //   format,         // 'JPG' | 'PNG' | 'GIF' 등 표시용
-        //   add_images,     // 제품컷 모드에서 카페24로 함께 전송할 추가이미지 원본 URL 목록
+        //   add_images,     // 추가이미지 원본 URL 목록 (대표이미지와 같은 가공모드로 함께 변환됨)
         //   preview_url,    // /api/convert 성공 후 채워지는 변환본 미리보기 URL
-        //   processed_filename, // /api/convert 성공 후 채워지는 서버측 가공 파일명 (send-cafe24에 그대로 재사용)
+        //   processed_filename,      // /api/convert 성공 후 채워지는 서버측 가공 파일명 (send-cafe24에 그대로 재사용)
+        //   processed_add_filenames, // 변환된 추가이미지 파일명 목록 (송신/다운로드에 재사용)
         //   status          // 화면 "진행 단계" 컬럼에 표시할 텍스트
         // }
         let productsData = [];
@@ -232,9 +244,17 @@
                     ...p,
                     preview_url: null,
                     processed_filename: null,
+                    processed_add_filenames: [],
                     status: '조회 완료'
                 }));
                 renderProductTable();
+
+                // 1:1 비율 필터로 몇 건이 제외됐는지 안내
+                const note = document.getElementById('filterNote');
+                const excluded = json.excluded_count || 0;
+                note.innerText = excluded > 0
+                    ? `(카페24 조회 ${json.fetched_count}건 중 원본이 1:1이 아닌 ${excluded}건 제외)`
+                    : '(원본이 1:1 비율인 상품만 표시됩니다)';
             } catch (e) {
                 alert(`상품 조회 중 오류가 발생했습니다: ${e.message}`);
             } finally {
@@ -303,11 +323,12 @@
         // ==========================================
         function renderProductTable() {
             const tbody = document.getElementById('productTableBody');
+            document.getElementById('totalCount').innerText = productsData.length;
 
             if (productsData.length === 0) {
                 tbody.innerHTML = `
                     <tr>
-                        <td colspan="7" class="p-6 text-center text-sm text-slate-400">
+                        <td colspan="8" class="p-6 text-center text-sm text-slate-400">
                             상단 검색창에서 모델명을 입력 후 조회해 주세요
                         </td>
                     </tr>`;
@@ -332,9 +353,18 @@
                     <td class="p-4">
                         <div class="font-semibold text-slate-800">${p.product_name}</div>
                         <div class="text-xs text-slate-400 mt-0.5">${p.product_code}</div>
+                        ${(p.add_images && p.add_images.length)
+                            ? `<div class="text-[11px] text-slate-400 mt-1">추가이미지 ${p.add_images.length}장 포함</div>`
+                            : ''}
                     </td>
                     <td class="p-4 text-center"><span class="px-2 py-1 bg-slate-100 text-slate-600 rounded text-xs font-mono">${p.format}</span></td>
                     <td class="p-4 text-center" id="status-cell-${p.product_no}">${statusBadge(p.status)}</td>
+                    <td class="p-4 text-center">
+                        <button onclick="downloadProduct('${p.product_no}')"
+                            class="px-2.5 py-1.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 rounded text-xs font-semibold transition-colors">
+                            ⬇️ 받기
+                        </button>
+                    </td>
                 </tr>
             `).join('');
         }
@@ -368,7 +398,9 @@
                             products: [{
                                 product_no: product.product_no,
                                 image_url: product.image_url,
-                                filename: product.filename
+                                filename: product.filename,
+                                // 추가이미지도 대표이미지와 같은 가공모드로 함께 변환한다
+                                add_images: product.add_images || []
                             }]
                         })
                     });
@@ -378,8 +410,15 @@
                     if (result && result.status === 'SUCCESS') {
                         product.preview_url = result.preview_url;
                         product.processed_filename = result.processed_filename;
+                        product.processed_add_filenames = result.processed_add_filenames || [];
+                        product.add_results = result.add_results || [];
+
+                        const addFailed = (result.add_results || []).filter(r => r.status === 'FAIL').length;
                         updatePreviewImage(product.product_no, result.preview_url);
                         setProductStatus(product.product_no, '변환 완료');
+                        if (addFailed > 0) {
+                            console.warn(`[추가이미지 일부 실패] ${product.product_no}: ${addFailed}건`);
+                        }
                     } else {
                         setProductStatus(product.product_no, '변환 실패');
                         console.error(`[변환 실패] ${product.product_no}:`, result && result.error);
@@ -422,7 +461,6 @@
         }
 
         async function sendItemsToCafe24(targets) {
-            const mode = document.getElementById('processMode').value; // 'product' | 'model'
             const sendBtn = document.getElementById('sendBtn');
             sendBtn.disabled = true;
             sendBtn.classList.add('opacity-50', 'cursor-not-allowed');
@@ -438,13 +476,12 @@
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
-                            mode: mode,
                             items: [{
                                 product_no: product.product_no,
                                 processed_filename: product.processed_filename,
-                                // 제품컷 모드: 원본 추가이미지를 서버가 1000x1400로 가공 후 반영
-                                // 모델컷 모드: 백엔드가 add_image: []로 강제 처리(기존 추가이미지 일괄 삭제)
-                                add_images: mode === 'product' ? (product.add_images || []) : []
+                                // 대표이미지/추가이미지 모두 1단계에서 같은 가공모드로 변환된
+                                // 파일을 그대로 반영한다 (가공모드에 따른 삭제 분기 없음).
+                                processed_add_filenames: product.processed_add_filenames || []
                             }]
                         })
                     });
@@ -481,6 +518,96 @@
             sendBtn.classList.remove('opacity-50', 'cursor-not-allowed');
 
             renderFailureArea(failures);
+        }
+
+        // ==========================================
+        // 변환 결과 다운로드 (POST /api/download -> ZIP)
+        // ==========================================
+        function toDownloadItem(product) {
+            return {
+                product_code: product.product_code || product.product_no,
+                product_no: product.product_no,
+                processed_filename: product.processed_filename,
+                processed_add_filenames: product.processed_add_filenames || []
+            };
+        }
+
+        async function downloadItems(items) {
+            const btn = document.getElementById('downloadBtn');
+            btn.disabled = true;
+            btn.classList.add('opacity-50', 'cursor-not-allowed');
+
+            try {
+                const res = await fetch('/api/download', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ items })
+                });
+
+                if (!res.ok) {
+                    // 실패 시에는 JSON 에러 본문이 내려온다
+                    let message = '다운로드에 실패했습니다.';
+                    try {
+                        const json = await res.json();
+                        message = json.error || message;
+                    } catch (e) { /* 본문이 JSON이 아니면 기본 메시지 사용 */ }
+                    alert(message);
+                    return;
+                }
+
+                // 응답(ZIP)을 blob으로 받아 브라우저 다운로드를 트리거한다
+                const blob = await res.blob();
+                const disposition = res.headers.get('Content-Disposition') || '';
+                const match = disposition.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
+                const fileName = match ? decodeURIComponent(match[1]) : 'thumbnails.zip';
+
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = fileName;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+            } catch (e) {
+                alert(`다운로드 중 오류가 발생했습니다: ${e.message}`);
+            } finally {
+                btn.disabled = false;
+                btn.classList.remove('opacity-50', 'cursor-not-allowed');
+            }
+        }
+
+        // 표의 행별 "받기" 버튼 - 해당 상품 1건만 다운로드
+        async function downloadProduct(productNo) {
+            const product = findProduct(productNo);
+            if (!product) return;
+
+            if (!product.processed_filename) {
+                alert('아직 변환되지 않은 상품입니다. 먼저 [1단계: 변환실행]을 진행해 주세요.');
+                return;
+            }
+            await downloadItems([toDownloadItem(product)]);
+        }
+
+        // 상단 "다운로드" 버튼 - 선택된 상품 전체를 ZIP으로 다운로드
+        async function downloadSelected() {
+            const selected = getSelectedProducts();
+            if (selected.length === 0) {
+                alert('다운로드할 상품을 1건 이상 선택해 주세요.');
+                return;
+            }
+
+            const targets = selected.filter(p => p.processed_filename);
+            const skipped = selected.length - targets.length;
+            if (targets.length === 0) {
+                alert('선택한 상품이 아직 변환되지 않았습니다. 먼저 [1단계: 변환실행]을 진행해 주세요.');
+                return;
+            }
+            if (skipped > 0) {
+                alert(`변환되지 않은 ${skipped}건은 이번 다운로드에서 제외됩니다.`);
+            }
+
+            await downloadItems(targets.map(toDownloadItem));
         }
 
         // ==========================================

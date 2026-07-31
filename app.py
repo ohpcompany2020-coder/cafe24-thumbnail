@@ -1,17 +1,20 @@
 import os
 import io
+import re
 import time
 import html
 import base64
 import logging
 import threading
 import ftplib
+import zipfile
 import requests
 from urllib.parse import urlencode
 from dotenv import load_dotenv
-from flask import Flask, request, jsonify, render_template, send_from_directory
+from flask import Flask, request, jsonify, render_template, send_from_directory, send_file
 from werkzeug.exceptions import HTTPException
-from PIL import Image, ImageSequence
+from concurrent.futures import ThreadPoolExecutor
+from PIL import Image, ImageFile, ImageSequence
 
 load_dotenv()
 
@@ -304,6 +307,49 @@ def fetch_image(url, timeout=10):
 
     # 모든 후보 Referer에서 403이 발생한 경우 마지막 응답으로 에러를 표면화
     last_error.raise_for_status()
+
+def get_remote_image_size(url, timeout=8):
+    """이미지 전체를 내려받지 않고 헤더 부분만 스트리밍해서 (width, height)를 얻는다.
+
+    검색 결과의 모든 상품 이미지를 원본 그대로 받으면 느리므로, PIL의 증분 파서에
+    앞부분 청크만 흘려넣어 크기가 확정되는 즉시 연결을 끊는다.
+    실패하면 None을 반환한다 (호출부에서 '판정 불가'로 처리)."""
+    if not url:
+        return None
+
+    for referer in SHOP_REFERER_CANDIDATES:
+        try:
+            headers = {'User-Agent': IMAGE_DOWNLOAD_USER_AGENT, 'Referer': referer}
+            with requests.get(url, headers=headers, timeout=timeout, stream=True) as resp:
+                if resp.status_code == 403:
+                    continue
+                resp.raise_for_status()
+
+                parser = ImageFile.Parser()
+                for chunk in resp.iter_content(chunk_size=4096):
+                    if not chunk:
+                        continue
+                    parser.feed(chunk)
+                    if parser.image:
+                        return parser.image.size
+        except Exception as e:
+            logger.debug(f"[이미지 크기 조회 실패] url={url} referer={referer}: {e}")
+            continue
+
+    return None
+
+
+def is_square_image(url, tolerance=0.02):
+    """이미지가 1:1 비율인지 판정한다. 크기를 확인하지 못하면 None(판정 불가)을 반환한다."""
+    size = get_remote_image_size(url)
+    if not size:
+        return None
+
+    width, height = size
+    if not width or not height:
+        return None
+    return abs((height / width) - 1.0) <= tolerance
+
 
 def verify_image_dimensions(product_no, field_name, image_url, expected_ratio=1.4, tolerance=0.02, retry_delay=3):
     """카페24가 실제로 반영한 이미지 URL을 다시 받아 PIL로 실제 크기/비율을 로그로 남긴다.
@@ -1086,6 +1132,8 @@ def search_products():
     limit = min(int(request.args.get('limit', 20)), 100)
     sort = request.args.get('sort', '').strip()
     order = request.args.get('order', '').strip()
+    # 원본 대표이미지가 1:1인 상품만 표시 (변환 대상이 정방형 이미지이므로 기본 활성화)
+    only_square = request.args.get('only_square', 'true').lower() != 'false'
 
     if not keyword:
         return jsonify({"success": False, "error": "검색어를 입력해 주세요."}), 400
@@ -1160,7 +1208,48 @@ def search_products():
                 "add_images": add_images
             })
 
-        return jsonify({"success": True, "data": products, "requested_url": res.url})
+        fetched_count = len(products)
+        excluded = []
+
+        if only_square and products:
+            # 원본 대표이미지를 실제로 열어 1:1인 상품만 남긴다. 상품 수만큼 요청이
+            # 필요하므로 병렬로 처리하고, 크기를 확인하지 못한 상품은 임의로 지우지 않고
+            # 그대로 남긴다 (조회 실패를 "비정방형"으로 오판하지 않기 위함).
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                square_flags = list(executor.map(lambda p: is_square_image(p['image_url']), products))
+
+            kept = []
+            for product, is_square in zip(products, square_flags):
+                if is_square is False:
+                    excluded.append({
+                        "product_no": product['product_no'],
+                        "product_code": product['product_code'],
+                        "reason": "원본 대표이미지가 1:1 비율이 아님",
+                    })
+                    continue
+                if is_square is None:
+                    logger.warning(
+                        f"[비율 확인 실패] product_no={product['product_no']} "
+                        f"url={product['image_url']} - 목록에는 그대로 표시"
+                    )
+                    product['ratio_unknown'] = True
+                kept.append(product)
+
+            products = kept
+            logger.info(
+                f"[1:1 필터] 조회 {fetched_count}건 중 {len(products)}건 표시, "
+                f"{len(excluded)}건 제외"
+            )
+
+        return jsonify({
+            "success": True,
+            "data": products,
+            "total_count": len(products),
+            "fetched_count": fetched_count,
+            "excluded_count": len(excluded),
+            "excluded": excluded,
+            "requested_url": res.url
+        })
 
     except Cafe24ReauthRequired as e:
         logger.error(f"카페24 재인증 필요: {e}")
@@ -1178,6 +1267,7 @@ def search_products():
 # [1단계 API] 썸네일 변환 (미리보기 생성)
 @app.route('/api/convert', methods=['POST'])
 def convert_thumbnails():
+    """대표이미지와 추가이미지를 모두 같은 가공모드로 1000x1400 변환한다."""
     data = request.json or {}
     mode = data.get('mode', 'product')  # 'product' -> 상하 여백 채우기 / 'model' -> 확대 후 중앙 가로 크롭
     products = data.get('products', [])
@@ -1194,11 +1284,39 @@ def convert_thumbnails():
             output_file = process_image_bytes(resp.content, filename, mode)
             preview_url = f"/static/processed_images/{output_file}"
 
+            # 추가이미지도 대표이미지와 동일한 가공모드로 변환한다. 한 장이 실패해도
+            # 나머지와 대표이미지 결과까지 버리지 않고 계속 진행한다.
+            add_results = []
+            for idx, add_url in enumerate(item.get('add_images', []) or []):
+                add_source_name = os.path.basename((add_url or '').split('?')[0]) or f"{p_no}_add_{idx}.jpg"
+                add_ext = os.path.splitext(add_source_name)[1].lower() or '.jpg'
+                add_filename = f"{p_no}_add_{idx}{add_ext}"
+                try:
+                    add_resp = fetch_image(add_url, timeout=10)
+                    out_add_file = process_image_bytes(add_resp.content, add_filename, mode)
+                    add_results.append({
+                        "status": "SUCCESS",
+                        "source_url": add_url,
+                        "processed_filename": out_add_file,
+                        "preview_url": f"/static/processed_images/{out_add_file}",
+                    })
+                except Exception as add_err:
+                    logger.exception(f"추가이미지 변환 실패 (product_no={p_no} idx={idx} url={add_url})")
+                    add_results.append({
+                        "status": "FAIL",
+                        "source_url": add_url,
+                        "error": str(add_err),
+                    })
+
             results.append({
                 "product_no": p_no,
                 "status": "SUCCESS",
                 "preview_url": preview_url,
-                "processed_filename": output_file
+                "processed_filename": output_file,
+                "add_results": add_results,
+                "processed_add_filenames": [
+                    r["processed_filename"] for r in add_results if r["status"] == "SUCCESS"
+                ],
             })
         except Exception as e:
             logger.exception(f"상품 변환 실패 (product_no={p_no})")
@@ -1206,24 +1324,97 @@ def convert_thumbnails():
 
     return jsonify({"success": True, "data": results})
 
+# [다운로드 API] 변환된 이미지를 상품코드별 폴더로 묶어 ZIP으로 내려준다
+@app.route('/api/download', methods=['POST'])
+def download_processed_images():
+    """선택된 상품의 변환 결과(대표이미지 + 추가이미지)를 ZIP으로 묶어 반환한다.
+
+    JSON 구조 예시:
+    {
+      "items": [
+        {
+          "product_code": "P0000ABC",
+          "processed_filename": "processed_10.jpg",
+          "processed_add_filenames": ["processed_10_add_0.jpg"]
+        }
+      ]
+    }
+    """
+    data = request.json or {}
+    items = data.get('items', [])
+
+    if not items:
+        return jsonify({"success": False, "error": "다운로드할 상품이 없습니다."}), 400
+
+    missing = []
+    added_count = 0
+    buffer = io.BytesIO()
+
+    with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for item in items:
+            # 상품코드를 폴더명으로 쓰므로 경로 구분자 등 위험한 문자는 걸러낸다
+            raw_code = str(item.get('product_code') or item.get('product_no') or 'unknown')
+            folder = re.sub(r'[^0-9A-Za-z가-힣._-]', '_', raw_code) or 'unknown'
+
+            entries = []
+            main_file = item.get('processed_filename')
+            if main_file:
+                entries.append(('대표이미지', main_file))
+            for idx, add_file in enumerate(item.get('processed_add_filenames', []) or [], start=1):
+                entries.append((f'추가이미지{idx}', add_file))
+
+            for label, stored_name in entries:
+                stored_name = os.path.basename(stored_name)
+                source_path = os.path.join(UPLOAD_FOLDER, stored_name)
+                if not os.path.isfile(source_path):
+                    missing.append({"product_code": raw_code, "filename": stored_name})
+                    logger.warning(f"[다운로드] 파일 없음: {source_path}")
+                    continue
+
+                ext = os.path.splitext(stored_name)[1] or '.jpg'
+                zf.write(source_path, f"{folder}/{folder}_{label}{ext}")
+                added_count += 1
+
+    if added_count == 0:
+        return jsonify({
+            "success": False,
+            "error": "다운로드할 변환 파일을 찾지 못했습니다. 먼저 [1단계: 변환실행]을 진행해 주세요.",
+            "missing": missing
+        }), 404
+
+    buffer.seek(0)
+    if len(items) == 1:
+        raw_code = str(items[0].get('product_code') or items[0].get('product_no') or 'thumbnails')
+        base_name = re.sub(r'[^0-9A-Za-z가-힣._-]', '_', raw_code) or 'thumbnails'
+    else:
+        base_name = f"thumbnails_{time.strftime('%Y%m%d_%H%M%S')}"
+
+    logger.info(f"[다운로드] {len(items)}개 상품 / {added_count}개 파일 ZIP 생성 (누락 {len(missing)}건)")
+    return send_file(
+        buffer,
+        mimetype='application/zip',
+        as_attachment=True,
+        download_name=f"{base_name}.zip"
+    )
+
+
 # [2단계 API] FTP 업로드 & 카페24 전송
 @app.route('/api/send-cafe24', methods=['POST'])
 def send_to_cafe24():
-    """
+    """대표이미지와 추가이미지를 모두 갱신한다 (가공모드에 따른 삭제 분기 없음).
+
     JSON 구조 예시:
     {
-      "mode": "model",  // "product" 또는 "model"
       "items": [
          {
            "product_no": "10",
-           "processed_filename": "processed_10.jpg",
-           "add_images": ["https://.../add1.jpg"] // 제품컷 변환 시 필요
+           "processed_filename": "processed_10.jpg",            // 1단계에서 변환된 대표이미지
+           "processed_add_filenames": ["processed_10_add_0.jpg"] // 1단계에서 변환된 추가이미지
          }
       ]
     }
     """
     data = request.json or {}
-    mode = data.get('mode', 'product')
     items = data.get('items', [])
 
     success_list = []
@@ -1270,27 +1461,29 @@ def send_to_cafe24():
             # 'additional_image'이므로(위 search_products 참고) 쓰기도 같은 이름을 쓴다.
             # 기존의 {"images": {"add_image": [...]}} 중첩 구조는 카페24가 모르는 필드라
             # 200을 반환하면서도 조용히 무시했다.
-            if mode == 'model':
-                # [모델컷 모드] 추가이미지 일괄 삭제
-                put_request["additional_image"] = []
-            elif mode == 'product':
-                # [제품컷 모드] 추가이미지도 상하여백 가공 후 업데이트
-                raw_add_images = item.get('add_images', [])
-                processed_add_urls = []
+            #
+            # 가공모드(제품컷/모델컷)에 따라 추가이미지를 삭제하던 분기는 제거했다.
+            # 대표이미지든 추가이미지든 같은 가공모드로 변환해 전부 갱신만 한다.
+            # additional_image는 "보낸 목록으로 통째로 교체"되는 필드라, 올릴 이미지가
+            # 없을 때 빈 배열을 보내면 기존 추가이미지가 전부 지워진다. 그래서 올릴
+            # 이미지가 있을 때만 필드를 넣는다 (어떤 경우에도 삭제하지 않는다).
+            processed_add_urls = []
+            for add_filename in item.get('processed_add_filenames', []) or []:
+                add_local_path = os.path.join(UPLOAD_FOLDER, os.path.basename(add_filename))
+                if not os.path.isfile(add_local_path):
+                    logger.warning(f"[추가이미지 건너뜀] product_no={p_no} 파일 없음: {add_local_path}")
+                    continue
 
-                for idx, add_url in enumerate(raw_add_images):
-                    add_resp = fetch_image(add_url, timeout=10)
+                upload_to_ftp(add_local_path, os.path.basename(add_filename), remote_dir=remote_dir)
+                # 대표이미지와 동일하게 "http:// 절대URL"이 아니라 웹FTP 경로를 넘긴다
+                # (절대URL 형태는 대표이미지에서 Wrong image path로 거부됐다).
+                processed_add_urls.append(f"{remote_dir}{os.path.basename(add_filename)}")
 
-                    add_filename = f"{p_no}_add_{idx}.jpg"
-                    out_add_file = process_image_bytes(add_resp.content, add_filename, 'product')
-                    out_add_path = os.path.join(UPLOAD_FOLDER, out_add_file)
-
-                    upload_to_ftp(out_add_path, out_add_file, remote_dir=remote_dir)
-                    # 대표이미지와 동일하게 "http:// 절대URL"이 아니라 웹FTP 경로를 넘긴다
-                    # (절대URL 형태는 대표이미지에서 Wrong image path로 거부됐다).
-                    processed_add_urls.append(f"{remote_dir}{out_add_file}")
-
+            if processed_add_urls:
                 put_request["additional_image"] = processed_add_urls
+                logger.info(f"[추가이미지 갱신] product_no={p_no} {len(processed_add_urls)}건 {processed_add_urls}")
+            else:
+                logger.info(f"[추가이미지 유지] product_no={p_no} 갱신할 추가이미지가 없어 필드를 보내지 않음")
 
             api_url = f"{CAFE24_API_BASE}/products/{p_no}"
             request_body = {"shop_no": 1, "request": put_request}

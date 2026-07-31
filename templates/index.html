@@ -210,8 +210,10 @@
             }
         }
 
-        // 카페24 API가 한 번에 주는 최대 건수. 이 단위로 offset을 옮겨가며 전부 조회한다.
-        const SEARCH_PAGE_SIZE = 100;
+        // 한 요청에서 처리할 건수. 상품마다 원본 이미지를 열어 비율을 확인하므로
+        // 100건씩 처리하면 서버 응답이 Render 요청 타임아웃(약 30초)을 넘겨 502가 난다.
+        // 작게 잘라 요청 수를 늘리는 대신 요청 하나의 시간을 짧게 유지한다.
+        const SEARCH_PAGE_SIZE = 30;
         // 검색 조건이 지나치게 넓을 때 무한정 조회하지 않도록 하는 안전장치
         const SEARCH_HARD_CAP = 3000;
 
@@ -258,7 +260,17 @@
                         order
                     });
                     const res = await fetch(`/api/products/search?${params.toString()}`);
-                    const json = await res.json();
+
+                    // 게이트웨이 타임아웃 등으로 JSON이 아닌 응답(HTML 에러 페이지)이
+                    // 올 수 있으므로 파싱 실패를 따로 처리한다. 이미 모은 결과는 버리지 않는다.
+                    let json;
+                    try {
+                        json = await res.json();
+                    } catch (parseErr) {
+                        alert(`서버 응답을 읽지 못했습니다 (offset=${offset}, HTTP ${res.status}).\n`
+                            + `지금까지 조회된 ${productsData.length}건만 표시합니다.`);
+                        break;
+                    }
 
                     if (!res.ok || !json.success) {
                         const message = json.error || '상품 조회에 실패했습니다.';
@@ -267,10 +279,13 @@
                                 window.open(json.reauth_url, '_blank', 'noopener,noreferrer');
                             }
                         } else {
-                            alert(message);
+                            alert(`${message}\n\n지금까지 조회된 ${productsData.length}건만 표시합니다.`);
                         }
-                        return;
+                        break;
                     }
+
+                    console.log(`[검색] offset=${offset} 소요 ${json.elapsed_seconds}초, `
+                        + `조회 ${json.fetched_count}건 -> 표시 ${(json.data || []).length}건`);
 
                     // 전체 건수는 첫 페이지 응답에만 담겨 온다
                     if (json.total_count !== null && json.total_count !== undefined) {

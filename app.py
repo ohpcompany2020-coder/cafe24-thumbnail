@@ -13,7 +13,7 @@ from urllib.parse import urlencode
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, render_template, send_from_directory, send_file
 from werkzeug.exceptions import HTTPException
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 from PIL import Image, ImageFile, ImageSequence
 
 load_dotenv()
@@ -308,7 +308,15 @@ def fetch_image(url, timeout=10):
     # 모든 후보 Referer에서 403이 발생한 경우 마지막 응답으로 에러를 표면화
     last_error.raise_for_status()
 
-def get_remote_image_size(url, timeout=8):
+# 이미지 1건당 비율 확인에 허용할 시간(초). 짧게 잡아 느린 이미지 하나가 페이지 전체를
+# 붙잡지 못하게 한다 - 확인 못 한 상품은 '판정 불가'로 두고 목록에는 그대로 남긴다.
+IMAGE_PROBE_TIMEOUT = float(os.getenv('IMAGE_PROBE_TIMEOUT', 4))
+# 한 페이지의 비율 확인 전체에 허용할 시간(초). 이 시간이 지나면 남은 건 포기하고 응답한다.
+# 카페24 API 호출 시간까지 더해도 Render 요청 타임아웃(약 30초) 안에 들어오도록 잡는다.
+IMAGE_PROBE_BUDGET = float(os.getenv('IMAGE_PROBE_BUDGET', 12))
+
+
+def get_remote_image_size(url, timeout=IMAGE_PROBE_TIMEOUT):
     """이미지 전체를 내려받지 않고 헤더 부분만 스트리밍해서 (width, height)를 얻는다.
 
     검색 결과의 모든 상품 이미지를 원본 그대로 받으면 느리므로, PIL의 증분 파서에
@@ -339,9 +347,9 @@ def get_remote_image_size(url, timeout=8):
     return None
 
 
-def is_square_image(url, tolerance=0.02):
+def is_square_image(url, tolerance=0.02, timeout=IMAGE_PROBE_TIMEOUT):
     """이미지가 1:1 비율인지 판정한다. 크기를 확인하지 못하면 None(판정 불가)을 반환한다."""
-    size = get_remote_image_size(url)
+    size = get_remote_image_size(url, timeout=timeout)
     if not size:
         return None
 
@@ -349,6 +357,55 @@ def is_square_image(url, tolerance=0.02):
     if not width or not height:
         return None
     return abs((height / width) - 1.0) <= tolerance
+
+
+def probe_square_flags(products, budget_seconds=IMAGE_PROBE_BUDGET, max_workers=16):
+    """상품 목록의 1:1 여부를 병렬로 확인한다.
+
+    전체에 시간 상한(budget)을 둔다. 이미지 서버가 느리거나 응답하지 않을 때
+    페이지 처리가 무한정 늘어나 요청 자체가 타임아웃(502)되는 것을 막기 위함이다.
+    상한 안에 끝내지 못한 상품은 None(판정 불가)으로 두어 목록에 그대로 남긴다.
+
+    executor.shutdown(wait=False)로 남은 작업을 기다리지 않고 즉시 반환한다.
+    (with 블록을 쓰면 shutdown이 실행 중인 작업을 모두 기다려 상한이 무의미해진다)"""
+    flags = [None] * len(products)
+    if not products:
+        return flags
+
+    started = time.monotonic()
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    try:
+        future_to_index = {
+            executor.submit(is_square_image, product['image_url']): idx
+            for idx, product in enumerate(products)
+        }
+
+        done, not_done = futures_wait(future_to_index.keys(), timeout=budget_seconds)
+
+        for future in done:
+            idx = future_to_index[future]
+            try:
+                flags[idx] = future.result()
+            except Exception as e:
+                logger.warning(f"[비율 확인 예외] product_no={products[idx].get('product_no')}: {e}")
+                flags[idx] = None
+
+        for future in not_done:
+            future.cancel()
+            idx = future_to_index[future]
+            logger.warning(
+                f"[비율 확인 시간초과] product_no={products[idx].get('product_no')} "
+                f"url={products[idx].get('image_url')} - 판정 불가로 두고 목록에는 표시"
+            )
+    finally:
+        executor.shutdown(wait=False)
+
+    elapsed = time.monotonic() - started
+    timed_out = sum(1 for f in flags if f is None)
+    logger.info(
+        f"[비율 확인] {len(products)}건 처리 {elapsed:.1f}초 (판정 불가 {timed_out}건)"
+    )
+    return flags
 
 
 def verify_image_dimensions(product_no, field_name, image_url, expected_ratio=1.4, tolerance=0.02, retry_delay=3):
@@ -1126,6 +1183,10 @@ def cafe24_auth_callback():
 
 # 카페24 Admin API의 상품 목록 조회 limit 상한
 CAFE24_PRODUCTS_MAX_LIMIT = 100
+# 한 요청에서 처리할 기본 건수. 상품마다 이미지를 열어 비율을 확인해야 하므로 100건을
+# 한 번에 처리하면 Render의 요청 타임아웃(약 30초)에 걸려 502가 난다. 페이지를 잘게
+# 나눠 한 요청의 처리 시간을 짧게 유지한다.
+CAFE24_PRODUCTS_DEFAULT_LIMIT = int(os.getenv('SEARCH_PAGE_SIZE', 30))
 
 
 def build_product_search_params(search_type, keyword):
@@ -1190,30 +1251,38 @@ def search_products():
     한 요청에 담으면 응답이 너무 오래 걸리고(게이트웨이 타임아웃 위험) 진행 상황도
     보여줄 수 없기 때문이다. 프런트가 total_count를 보고 offset을 이어서 호출한다.
     """
-    search_type = request.args.get('search_type', 'product_name')  # model_name | product_name | product_code
-    keyword = request.args.get('keyword', '').strip()
-    limit = min(int(request.args.get('limit', CAFE24_PRODUCTS_MAX_LIMIT)), CAFE24_PRODUCTS_MAX_LIMIT)
-    offset = max(int(request.args.get('offset', 0)), 0)
-    sort = request.args.get('sort', '').strip()
-    order = request.args.get('order', '').strip()
-    # 원본 대표이미지가 1:1인 상품만 표시 (변환 대상이 정방형 이미지이므로 기본 활성화)
-    only_square = request.args.get('only_square', 'true').lower() != 'false'
-    # 진열함 + 판매함 + 품절아님 상품만 표시
-    only_available = request.args.get('only_available', 'true').lower() != 'false'
-
-    if not keyword:
-        return jsonify({"success": False, "error": "검색어를 입력해 주세요."}), 400
-
-    search_params = build_product_search_params(search_type, keyword)
-    params = {**search_params, "limit": limit, "offset": offset}
-    if sort:
-        params['sort'] = sort
-    if order:
-        params['order'] = order
-
-    logger.info(f"카페24 상품 검색 요청: search_type={search_type} -> params={params}")
-
+    # 파라미터 파싱까지 포함해 라우트 전체를 감싼다. 잘못된 쿼리스트링(int 변환 실패
+    # 등)으로 예외가 나도 HTML 에러 페이지가 아니라 항상 JSON을 돌려주기 위함이다.
+    page_started = time.monotonic()
+    offset = 0
     try:
+        search_type = request.args.get('search_type', 'product_name')  # model_name | product_name | product_code
+        keyword = request.args.get('keyword', '').strip()
+        try:
+            limit = min(int(request.args.get('limit', CAFE24_PRODUCTS_DEFAULT_LIMIT)), CAFE24_PRODUCTS_MAX_LIMIT)
+            offset = max(int(request.args.get('offset', 0)), 0)
+        except (TypeError, ValueError):
+            return jsonify({"success": False, "error": "limit/offset은 숫자여야 합니다."}), 400
+
+        sort = request.args.get('sort', '').strip()
+        order = request.args.get('order', '').strip()
+        # 원본 대표이미지가 1:1인 상품만 표시 (변환 대상이 정방형 이미지이므로 기본 활성화)
+        only_square = request.args.get('only_square', 'true').lower() != 'false'
+        # 진열함 + 판매함 + 품절아님 상품만 표시
+        only_available = request.args.get('only_available', 'true').lower() != 'false'
+
+        if not keyword:
+            return jsonify({"success": False, "error": "검색어를 입력해 주세요."}), 400
+
+        search_params = build_product_search_params(search_type, keyword)
+        params = {**search_params, "limit": limit, "offset": offset}
+        if sort:
+            params['sort'] = sort
+        if order:
+            params['order'] = order
+
+        logger.info(f"카페24 상품 검색 요청: search_type={search_type} -> params={params}")
+
         # 전체 건수는 첫 페이지에서만 조회한다 (이후 페이지는 프런트가 이미 알고 있음)
         total_count = fetch_product_total_count(search_params) if offset == 0 else None
         if offset == 0:
@@ -1297,8 +1366,7 @@ def search_products():
         # 요청이 필요하므로 병렬로 처리하고, 크기를 확인하지 못한 상품은 임의로 지우지
         # 않고 그대로 남긴다 (조회 실패를 "비정방형"으로 오판하지 않기 위함).
         if only_square and products:
-            with ThreadPoolExecutor(max_workers=8) as executor:
-                square_flags = list(executor.map(lambda p: is_square_image(p['image_url']), products))
+            square_flags = probe_square_flags(products)
 
             kept = []
             for product, is_square in zip(products, square_flags):
@@ -1320,8 +1388,10 @@ def search_products():
             products = kept
 
         excluded_ratio_count = len(excluded) - excluded_status_count
+        elapsed = time.monotonic() - page_started
         logger.info(
-            f"[검색 필터] offset={offset} 조회 {fetched_count}건 중 {len(products)}건 표시 "
+            f"[페이지 처리 완료] offset={offset} 소요시간 {elapsed:.1f}초 - "
+            f"조회 {fetched_count}건 중 {len(products)}건 표시 "
             f"(상태 제외 {excluded_status_count}건 / 비1:1 제외 {excluded_ratio_count}건)"
         )
 
@@ -1330,6 +1400,7 @@ def search_products():
             "data": products,
             "offset": offset,
             "limit": limit,
+            "elapsed_seconds": round(elapsed, 1),
             "fetched_count": fetched_count,        # 이번 페이지에서 카페24가 준 원본 건수
             "total_count": total_count,            # 검색 조건 전체 건수 (첫 페이지에서만 채워짐)
             "has_more": fetched_count == limit,    # 다음 페이지가 더 있을 가능성
@@ -1350,8 +1421,14 @@ def search_products():
             **({"reauth_url": reauth_url} if reauth_url else {})
         }), 401
     except Exception as e:
-        logger.exception("카페24 상품 검색 요청 중 예외 발생")
-        return jsonify({"success": False, "error": f"카페24 상품 조회 중 오류가 발생했습니다: {str(e)}"}), 502
+        elapsed = time.monotonic() - page_started
+        logger.exception(f"카페24 상품 검색 요청 중 예외 발생 (offset={offset} 소요시간 {elapsed:.1f}초)")
+        return jsonify({
+            "success": False,
+            "error": f"카페24 상품 조회 중 오류가 발생했습니다: {str(e)}",
+            "offset": offset,
+            "elapsed_seconds": round(elapsed, 1),
+        }), 502
 
 
 # [1단계 API] 썸네일 변환 (미리보기 생성)

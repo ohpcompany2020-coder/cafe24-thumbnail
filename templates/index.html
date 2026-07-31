@@ -65,10 +65,13 @@
                 </div>
 
                 <div class="flex items-center gap-3">
-                    <select id="pageSize" class="px-3 py-1.5 border border-slate-300 rounded-lg text-sm text-slate-600 focus:outline-none">
-                        <option value="20">20개씩 보기</option>
-                        <option value="50">50개씩 보기</option>
-                        <option value="100">100개씩 보기</option>
+                    <!-- 카페24는 100건씩만 주므로 내부적으로 offset을 옮겨가며 전부 조회한다.
+                         아래는 그 순회를 어디까지 할지 정하는 상한값이다. -->
+                    <select id="maxScan" class="px-3 py-1.5 border border-slate-300 rounded-lg text-sm text-slate-600 focus:outline-none" title="검색 결과를 어디까지 조회할지 상한">
+                        <option value="all" selected>전체 조회</option>
+                        <option value="100">최대 100건</option>
+                        <option value="300">최대 300건</option>
+                        <option value="1000">최대 1000건</option>
                     </select>
 
                     <select id="sortOrder" onchange="searchProducts()" class="px-3 py-1.5 border border-slate-300 rounded-lg text-sm text-slate-600 focus:outline-none">
@@ -207,12 +210,26 @@
             }
         }
 
+        // 카페24 API가 한 번에 주는 최대 건수. 이 단위로 offset을 옮겨가며 전부 조회한다.
+        const SEARCH_PAGE_SIZE = 100;
+        // 검색 조건이 지나치게 넓을 때 무한정 조회하지 않도록 하는 안전장치
+        const SEARCH_HARD_CAP = 3000;
+
+        // 마지막 검색의 집계 정보 (총 상품수 / 제외 건수 표시에 사용)
+        let searchMeta = { scanned: 0, cafe24Total: null, excludedStatus: 0, excludedRatio: 0, done: false };
+
+        function resetSearchMeta() {
+            searchMeta = { scanned: 0, cafe24Total: null, excludedStatus: 0, excludedRatio: 0, done: false };
+        }
+
         // GET /api/products/search 호출 - 카페24 Admin API 기반 상품 검색
+        // 카페24는 한 번에 최대 100건만 주므로 offset을 옮겨가며 끝까지 반복 조회한다.
         async function searchProducts() {
             const searchType = document.getElementById('searchType').value;
             const keyword = document.getElementById('searchInput').value.trim();
-            const limit = document.getElementById('pageSize').value;
             const order = document.getElementById('sortOrder').value; // asc(등록순) | desc(등록역순)
+            const maxScanRaw = document.getElementById('maxScan').value;
+            const maxScan = maxScanRaw === 'all' ? SEARCH_HARD_CAP : parseInt(maxScanRaw, 10);
 
             if (!keyword) {
                 alert('검색어를 입력해 주세요.');
@@ -223,38 +240,78 @@
             searchBtn.disabled = true;
             searchBtn.classList.add('opacity-50', 'cursor-not-allowed');
 
-            try {
-                const params = new URLSearchParams({ search_type: searchType, keyword, limit, sort: 'created_date', order });
-                const res = await fetch(`/api/products/search?${params.toString()}`);
-                const json = await res.json();
+            productsData = [];
+            resetSearchMeta();
+            renderProductTable();
+            setProgress(0, 1, '상품 조회 중...');
 
-                if (!res.ok || !json.success) {
-                    const message = json.error || '상품 조회에 실패했습니다.';
-                    if (json.reauth_required && json.reauth_url) {
-                        if (confirm(`${message}\n\n지금 카페24 인증 페이지로 이동할까요?`)) {
-                            window.open(json.reauth_url, '_blank', 'noopener,noreferrer');
+            try {
+                let offset = 0;
+
+                while (true) {
+                    const params = new URLSearchParams({
+                        search_type: searchType,
+                        keyword,
+                        limit: SEARCH_PAGE_SIZE,
+                        offset,
+                        sort: 'created_date',
+                        order
+                    });
+                    const res = await fetch(`/api/products/search?${params.toString()}`);
+                    const json = await res.json();
+
+                    if (!res.ok || !json.success) {
+                        const message = json.error || '상품 조회에 실패했습니다.';
+                        if (json.reauth_required && json.reauth_url) {
+                            if (confirm(`${message}\n\n지금 카페24 인증 페이지로 이동할까요?`)) {
+                                window.open(json.reauth_url, '_blank', 'noopener,noreferrer');
+                            }
+                        } else {
+                            alert(message);
                         }
-                    } else {
-                        alert(message);
+                        return;
                     }
-                    return;
+
+                    // 전체 건수는 첫 페이지 응답에만 담겨 온다
+                    if (json.total_count !== null && json.total_count !== undefined) {
+                        searchMeta.cafe24Total = json.total_count;
+                    }
+
+                    productsData.push(...(json.data || []).map(p => ({
+                        ...p,
+                        preview_url: null,
+                        processed_filename: null,
+                        processed_add_filenames: [],
+                        status: '조회 완료'
+                    })));
+
+                    searchMeta.scanned += json.fetched_count || 0;
+                    searchMeta.excludedStatus += json.excluded_status_count || 0;
+                    searchMeta.excludedRatio += json.excluded_ratio_count || 0;
+
+                    // 페이지마다 즉시 화면에 반영해서 진행 상황이 보이게 한다
+                    renderProductTable();
+                    const totalForBar = searchMeta.cafe24Total || searchMeta.scanned;
+                    setProgress(
+                        Math.min(searchMeta.scanned, totalForBar),
+                        totalForBar,
+                        `상품 확인 중... (${searchMeta.scanned}/${searchMeta.cafe24Total ?? '?'}건 / 표시 대상 ${productsData.length}건)`
+                    );
+
+                    offset += SEARCH_PAGE_SIZE;
+
+                    const reachedTotal = searchMeta.cafe24Total !== null && searchMeta.scanned >= searchMeta.cafe24Total;
+                    if (!json.has_more || reachedTotal) break;
+
+                    if (offset >= maxScan) {
+                        alert(`조회 상한(${maxScan}건)에 도달해 중단했습니다. 검색 조건을 좁히거나 상한을 높여 주세요.`);
+                        break;
+                    }
                 }
 
-                productsData = (json.data || []).map(p => ({
-                    ...p,
-                    preview_url: null,
-                    processed_filename: null,
-                    processed_add_filenames: [],
-                    status: '조회 완료'
-                }));
+                searchMeta.done = true;
                 renderProductTable();
-
-                // 1:1 비율 필터로 몇 건이 제외됐는지 안내
-                const note = document.getElementById('filterNote');
-                const excluded = json.excluded_count || 0;
-                note.innerText = excluded > 0
-                    ? `(카페24 조회 ${json.fetched_count}건 중 원본이 1:1이 아닌 ${excluded}건 제외)`
-                    : '(원본이 1:1 비율인 상품만 표시됩니다)';
+                setProgress(1, 1, `상품 조회 완료 (${productsData.length}건 표시)`);
             } catch (e) {
                 alert(`상품 조회 중 오류가 발생했습니다: ${e.message}`);
             } finally {
@@ -321,9 +378,41 @@
         // ==========================================
         // 테이블 렌더링
         // ==========================================
+        // 총 상품수 / 제외 건수 안내를 항상 표에 붙여 렌더링한다.
+        // (검색 함수에서 따로 갱신하면 렌더 시점과 어긋나거나, 요소를 못 찾았을 때
+        //  예외가 나면서 안내가 통째로 사라질 수 있다)
+        function renderSearchSummary() {
+            const totalEl = document.getElementById('totalCount');
+            const noteEl = document.getElementById('filterNote');
+            if (totalEl) totalEl.innerText = productsData.length;
+            if (!noteEl) return;
+
+            if (searchMeta.scanned === 0) {
+                noteEl.innerText = '';
+                return;
+            }
+
+            const parts = [];
+            if (searchMeta.cafe24Total !== null) {
+                parts.push(`카페24 검색 ${searchMeta.cafe24Total}건 중 ${searchMeta.scanned}건 확인`);
+            } else {
+                parts.push(`${searchMeta.scanned}건 확인`);
+            }
+            if (searchMeta.excludedStatus > 0) {
+                parts.push(`진열/판매/품절 제외 ${searchMeta.excludedStatus}건`);
+            }
+            if (searchMeta.excludedRatio > 0) {
+                parts.push(`원본 비1:1 제외 ${searchMeta.excludedRatio}건`);
+            }
+            if (searchMeta.excludedStatus === 0 && searchMeta.excludedRatio === 0) {
+                parts.push('제외 0건');
+            }
+            noteEl.innerText = `(${parts.join(' / ')})`;
+        }
+
         function renderProductTable() {
             const tbody = document.getElementById('productTableBody');
-            document.getElementById('totalCount').innerText = productsData.length;
+            renderSearchSummary();
 
             if (productsData.length === 0) {
                 tbody.innerHTML = `

@@ -1124,21 +1124,13 @@ def cafe24_auth_callback():
         </body></html>
     """
 
-# [상품 검색 API] 카페24 Admin API로 상품 목록 조회
-@app.route('/api/products/search', methods=['GET'])
-def search_products():
-    search_type = request.args.get('search_type', 'product_name')  # model_name | product_name | product_code
-    keyword = request.args.get('keyword', '').strip()
-    limit = min(int(request.args.get('limit', 20)), 100)
-    sort = request.args.get('sort', '').strip()
-    order = request.args.get('order', '').strip()
-    # 원본 대표이미지가 1:1인 상품만 표시 (변환 대상이 정방형 이미지이므로 기본 활성화)
-    only_square = request.args.get('only_square', 'true').lower() != 'false'
+# 카페24 Admin API의 상품 목록 조회 limit 상한
+CAFE24_PRODUCTS_MAX_LIMIT = 100
 
-    if not keyword:
-        return jsonify({"success": False, "error": "검색어를 입력해 주세요."}), 400
 
-    params = {"limit": limit}
+def build_product_search_params(search_type, keyword):
+    """검색 조건(상품명/모델명/상품코드)을 카페24 API 파라미터로 변환한다."""
+    params = {}
     if search_type == 'product_code':
         params['product_code'] = keyword
     elif search_type == 'model_name':
@@ -1147,7 +1139,73 @@ def search_products():
         params['model_name'] = keyword.upper()
     else:
         params['product_name'] = keyword
+    return params
 
+
+def fetch_product_total_count(search_params):
+    """검색 조건에 맞는 전체 상품 수를 조회한다 (GET /products/count).
+
+    페이지네이션 종료 시점을 판단하는 용도. 실패하면 None을 반환하고, 호출부는
+    "빈 페이지가 나올 때까지 계속 조회"하는 방식으로 대체한다."""
+    try:
+        res = cafe24_api_request('GET', f"{CAFE24_API_BASE}/products/count", params=search_params, timeout=15)
+        if res.status_code >= 400:
+            logger.warning(f"[상품 수 조회 실패] status={res.status_code} body={res.text}")
+            return None
+
+        payload = res.json()
+        count = payload.get('count')
+        if isinstance(count, dict):  # 일부 응답이 {"count": {"count": N}} 형태일 수 있음
+            count = count.get('count')
+        return int(count) if count is not None else None
+    except Exception as e:
+        logger.warning(f"[상품 수 조회 예외] {e}")
+        return None
+
+
+def is_product_available(product):
+    """진열함 + 판매함 + 품절아님 상태인지 판정한다.
+
+    값이 응답에 없으면(API 버전에 따라 필드가 빠질 수 있음) 임의로 제외하지 않고
+    통과시킨다 - 조회되지 않은 필드 때문에 멀쩡한 상품이 사라지는 편이 더 나쁘다.
+    제외 사유 목록을 함께 돌려준다."""
+    reasons = []
+    if str(product.get('display', '')).upper() == 'F':
+        reasons.append('진열안함')
+    if str(product.get('selling', '')).upper() == 'F':
+        reasons.append('판매안함')
+    if str(product.get('sold_out', '')).upper() == 'T':
+        reasons.append('품절')
+    return (not reasons), reasons
+
+
+# [상품 검색 API] 카페24 Admin API로 상품 목록 조회 (offset 기반 페이지 단위)
+@app.route('/api/products/search', methods=['GET'])
+def search_products():
+    """검색 조건에 맞는 상품을 offset/limit 한 페이지씩 조회해 필터링 결과를 돌려준다.
+
+    카페24 API는 한 번에 최대 100건까지만 주므로 전체(예: 303건)를 보려면 offset을
+    옮겨가며 반복 호출해야 한다. 한 번에 전부 처리하지 않고 페이지 단위로 나눠
+    응답하는 이유는, 상품마다 원본 이미지를 열어 1:1 비율을 확인해야 해서 전체를
+    한 요청에 담으면 응답이 너무 오래 걸리고(게이트웨이 타임아웃 위험) 진행 상황도
+    보여줄 수 없기 때문이다. 프런트가 total_count를 보고 offset을 이어서 호출한다.
+    """
+    search_type = request.args.get('search_type', 'product_name')  # model_name | product_name | product_code
+    keyword = request.args.get('keyword', '').strip()
+    limit = min(int(request.args.get('limit', CAFE24_PRODUCTS_MAX_LIMIT)), CAFE24_PRODUCTS_MAX_LIMIT)
+    offset = max(int(request.args.get('offset', 0)), 0)
+    sort = request.args.get('sort', '').strip()
+    order = request.args.get('order', '').strip()
+    # 원본 대표이미지가 1:1인 상품만 표시 (변환 대상이 정방형 이미지이므로 기본 활성화)
+    only_square = request.args.get('only_square', 'true').lower() != 'false'
+    # 진열함 + 판매함 + 품절아님 상품만 표시
+    only_available = request.args.get('only_available', 'true').lower() != 'false'
+
+    if not keyword:
+        return jsonify({"success": False, "error": "검색어를 입력해 주세요."}), 400
+
+    search_params = build_product_search_params(search_type, keyword)
+    params = {**search_params, "limit": limit, "offset": offset}
     if sort:
         params['sort'] = sort
     if order:
@@ -1156,7 +1214,12 @@ def search_products():
     logger.info(f"카페24 상품 검색 요청: search_type={search_type} -> params={params}")
 
     try:
-        res = cafe24_api_request('GET', f"{CAFE24_API_BASE}/products", params=params, timeout=15)
+        # 전체 건수는 첫 페이지에서만 조회한다 (이후 페이지는 프런트가 이미 알고 있음)
+        total_count = fetch_product_total_count(search_params) if offset == 0 else None
+        if offset == 0:
+            logger.info(f"[상품 전체 건수] 검색조건={search_params} -> {total_count}")
+
+        res = cafe24_api_request('GET', f"{CAFE24_API_BASE}/products", params=params, timeout=20)
         logger.info(f"카페24 상품 검색 실제 요청 URL: {res.url} (status={res.status_code})")
 
         if res.status_code >= 400:
@@ -1183,12 +1246,29 @@ def search_products():
         if not isinstance(raw_products, list):
             raw_products = []
 
+        fetched_count = len(raw_products)
+        excluded = []
         products = []
+
         for p in raw_products:
             if not isinstance(p, dict):
                 continue
 
             product_no = p.get('product_no')
+            product_code = p.get('product_code', '')
+
+            # [1차 필터] 진열/판매/품절 상태. 이미지 확인보다 먼저 걸러야 불필요한
+            # 이미지 다운로드를 크게 줄일 수 있다.
+            if only_available:
+                available, reasons = is_product_available(p)
+                if not available:
+                    excluded.append({
+                        "product_no": str(product_no),
+                        "product_code": product_code,
+                        "reason": " / ".join(reasons),
+                    })
+                    continue
+
             main_image = p.get('detail_image') or p.get('list_image') or ''
             main_image = main_image if isinstance(main_image, str) else ''
             filename = os.path.basename(main_image.split('?')[0]) if main_image else f"{product_no}.jpg"
@@ -1200,21 +1280,23 @@ def search_products():
 
             products.append({
                 "product_no": str(product_no),
-                "product_code": p.get('product_code', ''),
+                "product_code": product_code,
                 "product_name": p.get('product_name', ''),
                 "image_url": main_image,
                 "filename": filename,
                 "format": ext,
-                "add_images": add_images
+                "add_images": add_images,
+                "display": p.get('display'),
+                "selling": p.get('selling'),
+                "sold_out": p.get('sold_out'),
             })
 
-        fetched_count = len(products)
-        excluded = []
+        excluded_status_count = len(excluded)
 
+        # [2차 필터] 원본 대표이미지를 실제로 열어 1:1인 상품만 남긴다. 상품 수만큼
+        # 요청이 필요하므로 병렬로 처리하고, 크기를 확인하지 못한 상품은 임의로 지우지
+        # 않고 그대로 남긴다 (조회 실패를 "비정방형"으로 오판하지 않기 위함).
         if only_square and products:
-            # 원본 대표이미지를 실제로 열어 1:1인 상품만 남긴다. 상품 수만큼 요청이
-            # 필요하므로 병렬로 처리하고, 크기를 확인하지 못한 상품은 임의로 지우지 않고
-            # 그대로 남긴다 (조회 실패를 "비정방형"으로 오판하지 않기 위함).
             with ThreadPoolExecutor(max_workers=8) as executor:
                 square_flags = list(executor.map(lambda p: is_square_image(p['image_url']), products))
 
@@ -1236,17 +1318,24 @@ def search_products():
                 kept.append(product)
 
             products = kept
-            logger.info(
-                f"[1:1 필터] 조회 {fetched_count}건 중 {len(products)}건 표시, "
-                f"{len(excluded)}건 제외"
-            )
+
+        excluded_ratio_count = len(excluded) - excluded_status_count
+        logger.info(
+            f"[검색 필터] offset={offset} 조회 {fetched_count}건 중 {len(products)}건 표시 "
+            f"(상태 제외 {excluded_status_count}건 / 비1:1 제외 {excluded_ratio_count}건)"
+        )
 
         return jsonify({
             "success": True,
             "data": products,
-            "total_count": len(products),
-            "fetched_count": fetched_count,
+            "offset": offset,
+            "limit": limit,
+            "fetched_count": fetched_count,        # 이번 페이지에서 카페24가 준 원본 건수
+            "total_count": total_count,            # 검색 조건 전체 건수 (첫 페이지에서만 채워짐)
+            "has_more": fetched_count == limit,    # 다음 페이지가 더 있을 가능성
             "excluded_count": len(excluded),
+            "excluded_status_count": excluded_status_count,
+            "excluded_ratio_count": excluded_ratio_count,
             "excluded": excluded,
             "requested_url": res.url
         })
@@ -1263,6 +1352,7 @@ def search_products():
     except Exception as e:
         logger.exception("카페24 상품 검색 요청 중 예외 발생")
         return jsonify({"success": False, "error": f"카페24 상품 조회 중 오류가 발생했습니다: {str(e)}"}), 502
+
 
 # [1단계 API] 썸네일 변환 (미리보기 생성)
 @app.route('/api/convert', methods=['POST'])

@@ -795,19 +795,91 @@ def _get_product_image_fields(product_no):
     }
 
 
+def _try_link_candidate(product_no, label, description, put_request, settle_seconds=2):
+    """PUT /products/{no} 후보 하나를 보내고, 실제 반영 여부까지 판정해서 dict로 반환한다.
+
+    카페24는 모르는 필드를 200과 함께 조용히 무시하므로 PUT 응답만으로는 반영 여부를
+    알 수 없다. 또 직전 후보가 값을 바꿔놨을 수 있으므로 기준값(before)은 반드시
+    "매 시도 직전"에 새로 캡처한다 - 업로드 전 한 번만 찍으면 false negative가 난다.
+    """
+    api_url = f"{CAFE24_API_BASE}/products/{product_no}"
+    body = {"shop_no": 1, "request": put_request}
+
+    before = _get_product_image_fields(product_no)
+    attempt = {
+        "candidate": label,
+        "description": description,
+        "request_payload": body,
+        "before": before,
+    }
+    logger.info(f"[연결 진단 요청] #{label} ({description}) payload={body} before={before}")
+
+    try:
+        res = cafe24_api_request('PUT', api_url, json=body, timeout=20)
+    except Cafe24ReauthRequired as e:
+        attempt.update({
+            "ok": False, "actually_linked": False,
+            "error": f"카페24 재인증 필요: {e}", "reauth_required": True
+        })
+        logger.error(f"[연결 진단 응답] #{label} 재인증 필요: {e}")
+        return attempt
+    except Exception as e:
+        attempt.update({"ok": False, "actually_linked": False, "error": f"{type(e).__name__}: {e}"})
+        logger.error(f"[연결 진단 응답] #{label} 요청 예외: {type(e).__name__}: {e}")
+        return attempt
+
+    try:
+        res_json = res.json()
+    except ValueError:
+        res_json = {"raw_text": res.text}
+
+    attempt.update({
+        "status": res.status_code,
+        "trace_id": res.headers.get('X-Trace-Id'),
+        "response_body": res_json,
+        "error_message": None if res.status_code == 200 else extract_cafe24_error_message(
+            res_json, f"HTTP {res.status_code}"),
+    })
+    logger.info(f"[연결 진단 응답] #{label} status={res.status_code} body={res_json}")
+
+    time.sleep(settle_seconds)  # 카페24 반영 시차
+    after = _get_product_image_fields(product_no)
+    linked = bool(after.get('list_image')) and after.get('list_image') != before.get('list_image')
+
+    attempt.update({
+        "after": after,
+        "actually_linked": linked,
+        "ok": res.status_code == 200 and linked,
+    })
+    logger.info(
+        f"[연결 진단 검증] #{label} 반영여부={linked} "
+        f"before_list_image={before.get('list_image')} after_list_image={after.get('list_image')}"
+    )
+    return attempt
+
+
 @app.route('/api/debug/product-link-test', methods=['GET', 'POST'])
 def debug_product_link_test():
-    """업로드된 이미지 경로를 "상품에 실제로 연결"하는 PUT 페이로드 형식을 찾는 진단 엔드포인트.
+    """웹FTP로 올린 이미지를 상품 대표이미지로 연결하는 PUT 형식을 찾는 진단 엔드포인트.
 
-    POST /products/images는 201로 성공해도 파일만 올라갈 뿐 상품에는 연결되지 않는다.
-    연결용 PUT /products/{no}의 정확한 필드 형식을 확정하기 위해 후보 페이로드를
-    순서대로 보내고, 매번 상품을 재조회해서 list_image가 실제로 바뀌었는지 확인한다.
+    지금까지 확인된 사실:
+      - POST /products/images는 base64를 201로 받아주지만 파일을 /web/upload/NNEditor/
+        (상세페이지 에디터용 저장소)에 올릴 뿐 상품에는 연결하지 않는다 (후보 E 실패).
+      - 상품의 실제 썸네일은 /web/product/big|medium|small|tiny/ 에 있으므로, PUT에
+        NNEditor 경로를 넣으면 "Wrong image path"가 난다 (후보 A/B/D 실패).
+      - image_upload_type 없이 detail_image만 보내면 "[Image type] The field is
+        required." - 즉 PUT은 detail_image를 제대로 읽고 있고 image_upload_type만
+        채우면 된다 (후보 C).
+      - image_upload_type: A=대표이미지등록, B=개별이미지등록, C=웹FTP 등록.
+        FTP로 올린 파일에 맞는 값은 C인데 아직 한 번도 시도하지 않았다.
+
+    그래서 이 엔드포인트는 변환된 이미지를 먼저 FTP(/web/upload/thumbnail/, 이미 성공이
+    검증된 경로)에 올린 뒤, 그 파일을 가리키는 경로 표기 4종을 image_upload_type="C"로
+    시도하고(F~I), 마지막으로 type="B" + 4종 개별 지정(J)을 시도한다.
 
     사용법:
-      GET /api/debug/product-link-test?product_no=676&image_path=https://.../NNEditor/.../x.jpg
-
-    image_path를 생략하면 filename(또는 가장 최근 변환 파일)을 base64로 먼저 업로드해
-    반환된 path를 사용한다.
+      GET /api/debug/product-link-test?product_no=676&filename=processed_676.jpg
+      (filename 생략 시 static/processed_images의 가장 최근 파일 사용)
     """
     payload = request.json if request.method == 'POST' and request.is_json else {}
     payload = payload or {}
@@ -826,178 +898,72 @@ def debug_product_link_test():
     except (TypeError, ValueError):
         return jsonify({"success": False, "error": f"product_no는 숫자여야 합니다: {product_no}"}), 400
 
-    image_path = _param('image_path')
-    upload_step = {"performed": False}
-
-    # [중요] 기준점(baseline)은 반드시 "업로드 전"에 찍어야 한다. 업로드 후에 찍으면
-    # POST /products/images가 이미 상품에 연결까지 해버린 경우 baseline에 새 경로가
-    # 들어가고, 이후 PUT 후보들은 전부 "바뀐 게 없다"(new == new)로 보여 false negative가
-    # 난다 - 4개 후보가 모두 실패로 보고된 원인일 수 있다.
-    baseline = _get_product_image_fields(product_no)
-    logger.info(f"[연결 진단 baseline(업로드 전)] product_no={product_no} {baseline}")
-
-    # image_path가 없으면 base64 업로드부터 수행해서 path를 확보한다.
-    if not image_path:
-        filename = _param('filename')
-        if not filename:
-            local_files = [
-                f for f in os.listdir(UPLOAD_FOLDER)
-                if os.path.isfile(os.path.join(UPLOAD_FOLDER, f)) and not f.startswith('_ftp_test')
-            ]
-            if not local_files:
-                return jsonify({
-                    "success": False,
-                    "error": "image_path도 없고 변환된 이미지 파일도 없습니다. image_path를 직접 지정해 주세요."
-                }), 400
-            filename = max(local_files, key=lambda f: os.path.getmtime(os.path.join(UPLOAD_FOLDER, f)))
-
-        filename = os.path.basename(filename)
-        local_path = os.path.join(UPLOAD_FOLDER, filename)
-        if not os.path.isfile(local_path):
-            return jsonify({"success": False, "error": f"파일을 찾을 수 없습니다: {local_path}"}), 400
-
-        with open(local_path, 'rb') as f:
-            encoded = base64.b64encode(f.read()).decode()
-        ext = os.path.splitext(filename)[1].lower()
-        mime = {'.png': 'image/png', '.gif': 'image/gif'}.get(ext, 'image/jpeg')
-
-        upload_attempt = _register_image_attempt(
-            product_no, "upload", "base64 업로드로 image_path 확보",
-            f"data:{mime};base64,{encoded}"
-        )
-        upload_step = {"performed": True, "filename": filename, "attempt": upload_attempt}
-        if not upload_attempt.get("ok"):
+    filename = _param('filename')
+    if not filename:
+        local_files = [
+            f for f in os.listdir(UPLOAD_FOLDER)
+            if os.path.isfile(os.path.join(UPLOAD_FOLDER, f)) and not f.startswith('_ftp_test')
+        ]
+        if not local_files:
             return jsonify({
                 "success": False,
-                "error": "이미지 업로드(POST /products/images)가 실패해 연결 테스트를 진행할 수 없습니다.",
-                "upload_step": upload_step
-            }), 502
-        image_path = _extract_uploaded_image_path(upload_attempt.get("response_body"))
-        if not image_path:
-            return jsonify({
-                "success": False,
-                "error": "업로드 응답에서 path를 찾지 못했습니다.",
-                "upload_step": upload_step
-            }), 502
+                "error": "filename 파라미터가 없고 변환된 이미지 파일도 없습니다. "
+                         "먼저 변환(/api/convert)을 실행해 주세요."
+            }), 400
+        filename = max(local_files, key=lambda f: os.path.getmtime(os.path.join(UPLOAD_FOLDER, f)))
 
-    attempts = []
-    api_url = f"{CAFE24_API_BASE}/products/{product_no}"
+    filename = os.path.basename(filename)
+    local_path = os.path.join(UPLOAD_FOLDER, filename)
+    if not os.path.isfile(local_path):
+        return jsonify({"success": False, "error": f"파일을 찾을 수 없습니다: {local_path}"}), 400
 
-    # [후보 E] PUT을 아예 보내지 않고, 업로드만으로 상품에 연결됐는지 확인한다.
-    # POST /products/images 요청 payload에 이미 product_no가 들어가므로, 이 API가
-    # 업로드와 상품 연결을 한 번에 처리할 가능성이 있다. 그렇다면 PUT 단계 자체가
-    # 불필요하다.
-    if upload_step.get("performed"):
-        time.sleep(2)  # 카페24 쪽 반영 시차를 감안해 잠시 대기
-        after_upload = _get_product_image_fields(product_no)
-        linked_by_upload = (
-            bool(after_upload.get('list_image'))
-            and after_upload.get('list_image') != baseline.get('list_image')
-        )
-        attempts.append({
-            "candidate": "E",
-            "description": "PUT 없이 base64 업로드(POST /products/images)만으로 연결되는지 확인",
-            "request_payload": None,
-            "status": upload_step["attempt"].get("status"),
-            "before": baseline,
-            "after": after_upload,
-            "actually_linked": linked_by_upload,
-            "ok": linked_by_upload,
-        })
-        logger.info(
-            f"[연결 진단 #E] 업로드만으로 반영여부={linked_by_upload} "
-            f"baseline_list_image={baseline.get('list_image')} after_list_image={after_upload.get('list_image')}"
-        )
-        before = after_upload
-    else:
-        attempts.append({
-            "candidate": "E",
-            "description": "PUT 없이 업로드만으로 연결되는지 확인",
-            "skipped": True,
-            "reason": "image_path를 직접 지정해 업로드를 수행하지 않았으므로 테스트 불가",
-            "actually_linked": False,
-            "ok": False,
-        })
-        before = baseline
-
-    # 후보 E가 성공하면 PUT 후보는 시도할 필요가 없다.
-    if attempts[0].get("actually_linked"):
-        logger.info("[연결 진단] 업로드만으로 상품 연결 완료 - PUT 후보는 시도하지 않음")
+    # 1단계: 변환 이미지를 웹FTP로 업로드 (image_upload_type="C"의 전제 조건)
+    thumb_dir = '/web/upload/thumbnail/'
+    try:
+        ftp_url = upload_to_ftp(local_path, filename, remote_dir=thumb_dir)
+        ftp_step = {"ok": True, "remote_dir": thumb_dir, "filename": filename, "ftp_url": ftp_url}
+        logger.info(f"[연결 진단] FTP 업로드 성공: {ftp_url}")
+    except Exception as e:
+        logger.error(f"[연결 진단] FTP 업로드 실패: {type(e).__name__}: {e}")
         return jsonify({
-            "success": True,
-            "product_no": product_no,
-            "image_path": image_path,
-            "upload_step": upload_step,
-            "baseline_before_upload": baseline,
-            "summary": {
-                "working_candidate": "E",
-                "working_description": "POST /products/images 단독으로 업로드+상품연결이 모두 완료됨 (PUT 불필요)",
-                "any_linked": True,
-            },
-            "attempts": attempts,
-        })
+            "success": False,
+            "error": f"FTP 업로드에 실패해 연결 테스트를 진행할 수 없습니다: {type(e).__name__}: {e}",
+            "ftp_step": {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        }), 502
 
-    logger.info(f"[연결 진단 시작] product_no={product_no} image_path={image_path} 현재상태={before}")
+    ftp_abs_path = f"{thumb_dir}{filename}"                                   # /web/upload/thumbnail/x.jpg
+    ftp_https_url = f"https://{SHOP_PRIMARY_HOST}{thumb_dir}{filename}"       # 대표도메인 절대URL
+    ftp_no_web_path = f"/upload/thumbnail/{filename}"                         # /web 제외
 
-    # 연결용 PUT 페이로드 후보들. 어떤 필드명/중첩 구조를 카페24가 실제로 반영하는지 확인한다.
+    # 2단계: 연결용 PUT 후보. image_upload_type="C"(웹FTP 등록)에 경로 표기만 바꿔가며 시도한다.
     candidates = [
-        ("A", "flat + image_upload_type=B (대표이미지등록, detail_image만)",
-         {"shop_no": 1, "request": {"image_upload_type": "B", "detail_image": image_path}}),
-        ("B", "flat + image_upload_type=A (4종 개별 지정)",
-         {"shop_no": 1, "request": {
-             "image_upload_type": "A",
-             "detail_image": image_path, "list_image": image_path,
-             "tiny_image": image_path, "small_image": image_path,
-         }}),
-        ("C", "flat, image_upload_type 없이 detail_image만",
-         {"shop_no": 1, "request": {"detail_image": image_path}}),
-        ("D", "기존 방식: request.images 중첩 구조",
-         {"shop_no": 1, "request": {"images": {"detail_image": image_path, "list_image": image_path}}}),
+        ("F", 'image_upload_type="C" + detail_image=웹FTP 절대경로(/web 포함)',
+         {"image_upload_type": "C", "detail_image": ftp_abs_path}),
+        ("G", 'image_upload_type="C" + detail_image=대표도메인 https 절대URL',
+         {"image_upload_type": "C", "detail_image": ftp_https_url}),
+        ("H", 'image_upload_type="C" + detail_image=파일명만',
+         {"image_upload_type": "C", "detail_image": filename}),
+        ("I", 'image_upload_type="C" + detail_image=/web 제외 상대경로',
+         {"image_upload_type": "C", "detail_image": ftp_no_web_path}),
+        ("J", 'image_upload_type="B"(개별이미지등록) + 4종 모두 웹FTP 절대경로',
+         {
+             "image_upload_type": "B",
+             "detail_image": ftp_abs_path,
+             "list_image": ftp_abs_path,
+             "tiny_image": ftp_abs_path,
+             "small_image": ftp_abs_path,
+         }),
     ]
 
-    for label, description, body in candidates:
-        attempt = {"candidate": label, "description": description, "request_payload": body}
-        logger.info(f"[연결 진단 요청] #{label} ({description}) url={api_url} payload={body}")
-
-        try:
-            res = cafe24_api_request('PUT', api_url, json=body, timeout=20)
-        except Cafe24ReauthRequired as e:
-            attempt.update({"ok": False, "error": f"카페24 재인증 필요: {e}", "reauth_required": True})
-            attempts.append(attempt)
-            break
-        except Exception as e:
-            attempt.update({"ok": False, "error": f"{type(e).__name__}: {e}"})
-            attempts.append(attempt)
-            continue
-
-        try:
-            res_json = res.json()
-        except ValueError:
-            res_json = {"raw_text": res.text}
-
-        attempt.update({
-            "status": res.status_code,
-            "trace_id": res.headers.get('X-Trace-Id'),
-            "response_body": res_json,
-            "error_message": None if res.status_code == 200 else extract_cafe24_error_message(
-                res_json, f"HTTP {res.status_code}"),
-        })
-        logger.info(f"[연결 진단 응답] #{label} status={res.status_code} body={res_json}")
-
-        # PUT이 200이어도 실제로 반영됐는지는 재조회로만 확인할 수 있다
-        # (카페24는 모르는 필드를 200과 함께 조용히 무시한다).
-        time.sleep(1)
-        after = _get_product_image_fields(product_no)
-        linked = bool(after.get('list_image')) and after.get('list_image') != before.get('list_image')
-        attempt.update({
-            "after": after,
-            "ok": res.status_code == 200 and linked,
-            "actually_linked": linked,
-        })
-        logger.info(f"[연결 진단 검증] #{label} 반영여부={linked} after={after}")
-
+    attempts = []
+    for label, description, put_request in candidates:
+        attempt = _try_link_candidate(product_no, label, description, put_request)
         attempts.append(attempt)
-        if linked:
+
+        if attempt.get("reauth_required"):
+            logger.error("[연결 진단] 재인증이 필요해 남은 후보를 중단한다")
+            break
+        if attempt.get("actually_linked"):
             logger.info(f"[연결 진단] #{label} 형식이 실제로 반영됨 - 이후 후보는 시도하지 않음")
             break
         time.sleep(0.4)
@@ -1007,13 +973,18 @@ def debug_product_link_test():
     return jsonify({
         "success": True,
         "product_no": product_no,
-        "image_path": image_path,
-        "upload_step": upload_step,
-        "baseline_before_upload": baseline,
-        "before_put": before,
+        "filename": filename,
+        "ftp_step": ftp_step,
+        "tested_paths": {
+            "absolute_path": ftp_abs_path,
+            "https_url": ftp_https_url,
+            "filename_only": filename,
+            "no_web_path": ftp_no_web_path,
+        },
         "summary": {
             "working_candidate": winners[0]["candidate"] if winners else None,
             "working_description": winners[0]["description"] if winners else None,
+            "working_payload": winners[0]["request_payload"] if winners else None,
             "any_linked": bool(winners),
         },
         "attempts": attempts,

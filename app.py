@@ -194,32 +194,6 @@ def _extract_single_product(res_json):
     return None
 
 
-def _extract_uploaded_image_path(res_json):
-    """POST /products/images 응답에서 업로드된 이미지 경로(path)를 꺼낸다.
-    응답 형태는 {"images": [{"product_no":.., "path": "https://.../NNEditor/.../x.jpg"}]}."""
-    if not isinstance(res_json, dict):
-        return None
-
-    images = res_json.get('images')
-    if images is None:
-        images = res_json.get('image')
-
-    if isinstance(images, dict):
-        images = [images]
-    if not isinstance(images, list):
-        return None
-
-    for entry in images:
-        if isinstance(entry, dict):
-            path = entry.get('path') or entry.get('image_path') or entry.get('url')
-            if path:
-                return path
-        elif isinstance(entry, str) and entry:
-            return entry
-
-    return None
-
-
 def extract_cafe24_error_message(res_json, default='API 호출 실패'):
     """카페24 에러 응답은 엔드포인트에 따라 {"error": {...}} 단수 형태와
     {"errors": [{...}, ...]} 복수 형태가 섞여 있어 둘 다 처리한다."""
@@ -777,6 +751,23 @@ def debug_image_register_test():
     })
 
 
+# 카페24 상품의 이미지 필드 4종. 대표이미지 반영 여부는 이 중 하나라도 새 경로로
+# 바뀌었는지로 판정한다 (list_image 하나만 보면 detail_image만 바뀌는 경우를 놓친다).
+PRODUCT_IMAGE_FIELDS = ('detail_image', 'list_image', 'small_image', 'tiny_image')
+
+
+def _changed_image_fields(before, after):
+    """before 대비 after에서 새 값으로 바뀐 이미지 필드명 목록을 돌려준다."""
+    before = before or {}
+    after = after or {}
+    changed = []
+    for field in PRODUCT_IMAGE_FIELDS:
+        new_value = after.get(field)
+        if new_value and new_value != before.get(field):
+            changed.append(field)
+    return changed
+
+
 def _get_product_image_fields(product_no):
     """상품의 현재 이미지 필드를 단건 조회해서 dict로 반환한다 (진단/검증용)."""
     res = cafe24_api_request(
@@ -842,18 +833,32 @@ def _try_link_candidate(product_no, label, description, put_request, settle_seco
     })
     logger.info(f"[연결 진단 응답] #{label} status={res.status_code} body={res_json}")
 
+    # 반영 여부는 두 곳에서 각각 판정한다.
+    #  (1) PUT 응답 본문의 product - 카페24가 방금 반영한 값을 그대로 돌려주므로 가장 확실하다.
+    #  (2) 재조회 - 반영 시차/캐시로 옛 값이 잠시 더 보일 수 있어 (1)보다 늦게 바뀔 수 있다.
+    # list_image 하나만 비교하면 detail_image만 바뀌는 경우(F 후보)를 놓치므로 4종을 모두 본다.
+    responded_product = _extract_single_product(res_json) or {}
+    changed_in_response = _changed_image_fields(before, responded_product)
+
     time.sleep(settle_seconds)  # 카페24 반영 시차
     after = _get_product_image_fields(product_no)
-    linked = bool(after.get('list_image')) and after.get('list_image') != before.get('list_image')
+    changed_in_requery = _changed_image_fields(before, after)
+
+    changed_fields = changed_in_response or changed_in_requery
+    linked = bool(changed_fields)
 
     attempt.update({
         "after": after,
+        "response_product": {f: responded_product.get(f) for f in PRODUCT_IMAGE_FIELDS},
+        "changed_fields_in_response": changed_in_response,
+        "changed_fields_in_requery": changed_in_requery,
+        "changed_fields": changed_fields,
         "actually_linked": linked,
         "ok": res.status_code == 200 and linked,
     })
     logger.info(
-        f"[연결 진단 검증] #{label} 반영여부={linked} "
-        f"before_list_image={before.get('list_image')} after_list_image={after.get('list_image')}"
+        f"[연결 진단 검증] #{label} 반영여부={linked} 바뀐필드={changed_fields} "
+        f"(응답기준={changed_in_response} 재조회기준={changed_in_requery})"
     )
     return attempt
 
@@ -1230,83 +1235,41 @@ def send_to_cafe24():
         local_path = os.path.join(UPLOAD_FOLDER, filename)
 
         try:
-            # [대표 이미지 등록] /api/debug/image-register-test 진단 결과, FTP 업로드 후
-            # 만든 URL(절대/상대경로/파일명만 등 6가지 후보 + 별도 폴더 업로드 2가지)은
-            # 전부 카페24가 "[Upload Image] Wrong image path"로 거부했고, image 파라미터에
-            # base64 data URI를 직접 넣는 방식만 201로 성공했다. 따라서 대표 이미지는 FTP
-            # 업로드 없이 변환된 로컬 파일을 읽어 base64로 인코딩해 바로 전달한다.
+            # [대표이미지 등록 방식 - /api/debug/product-link-test 진단으로 확정]
+            #   - POST /products/images(base64)는 201로 성공하지만 파일을 상세페이지
+            #     에디터 저장소(/web/upload/NNEditor/)에 올릴 뿐 상품에 연결하지 않는다.
+            #   - 상품 썸네일은 /web/product/big|medium|small|tiny/ 에 있어야 하므로
+            #     NNEditor 경로를 PUT에 넣으면 "Wrong image path"가 난다.
+            #   - 웹FTP로 /web/upload/thumbnail/에 올린 뒤 그 경로를 PUT에 넘기면
+            #     카페24가 /web/product/... 로 옮겨 담아 실제로 반영된다.
+            # 후보 J(image_upload_type="B" + 4종 전부 지정)가 list/small/tiny까지
+            # 한 번에 갱신해서 가장 완전했으므로 그 형식을 사용한다.
             if not os.path.isfile(local_path):
                 raise Exception(f"변환된 이미지 파일을 찾을 수 없습니다: {local_path}")
 
-            # 업로드가 실제로 대표이미지를 바꿨는지 판정하려면 "업로드 전" 값이 필요하다.
+            # 반영 여부를 판정하려면 "변경 전" 값이 필요하다.
             baseline_images = _get_product_image_fields(p_no)
             logger.info(f"[송신 전 이미지 상태] product_no={p_no} {baseline_images}")
 
-            with open(local_path, 'rb') as f:
-                encoded_image = base64.b64encode(f.read()).decode()
-            ext = os.path.splitext(filename)[1].lower()
-            mime_type = {'.png': 'image/png', '.gif': 'image/gif'}.get(ext, 'image/jpeg')
-            image_data_uri = f"data:{mime_type};base64,{encoded_image}"
+            # 1. 웹FTP 업로드 (image_upload_type="B"/"C"가 참조할 실제 파일)
+            remote_dir = '/web/upload/thumbnail/'
+            ftp_url = upload_to_ftp(local_path, filename, remote_dir=remote_dir)
+            ftp_path = f"{remote_dir}{filename}"
+            logger.info(f"[FTP 업로드 완료] product_no={p_no} url={ftp_url} PUT 전달 경로={ftp_path}")
 
-            image_upload_url = f"{CAFE24_API_BASE}/products/images"
-            image_upload_body = {
-                "shop_no": 1,
-                "requests": [
-                    {"product_no": int(p_no), "image": image_data_uri}
-                ]
+            # 2. 대표이미지 4종을 모두 방금 올린 경로로 지정 (카페24가 크기별로 리사이징한다)
+            put_request = {
+                "image_upload_type": "B",
+                "detail_image": ftp_path,
+                "list_image": ftp_path,
+                "small_image": ftp_path,
+                "tiny_image": ftp_path,
             }
-            logger.info(
-                f"[카페24 이미지 등록 요청] product_no={p_no} url={image_upload_url} "
-                f"image_length={len(image_data_uri)} image_preview={image_data_uri[:50]}..."
-            )
 
-            img_res = cafe24_api_request('POST', image_upload_url, json=image_upload_body, timeout=20)
-            img_res_json = img_res.json()
-            logger.info(f"[카페24 이미지 등록 응답] product_no={p_no} status={img_res.status_code} body={img_res_json}")
-
-            if img_res.status_code != 201:
-                trace_id = img_res.headers.get('X-Trace-Id') or img_res.headers.get('X-Trace_ID')
-                logger.error(
-                    f"[카페24 이미지 등록 응답 헤더] product_no={p_no} X-Trace-Id={trace_id} "
-                    f"전체 헤더={dict(img_res.headers)}"
-                )
-                img_err_msg = extract_cafe24_error_message(img_res_json, '이미지 등록 API 호출 실패')
-                logger.error(f"카페24 이미지 등록 실패 (product_no={p_no}): {img_err_msg}")
-                fail_list.append({"product_no": p_no, "reason": img_err_msg})
-                continue
-
-            uploaded_path = _extract_uploaded_image_path(img_res_json)
-            if not uploaded_path:
-                raise Exception(f"이미지 업로드 응답에서 path를 찾지 못했습니다: {img_res_json}")
-            logger.info(f"[카페24 이미지 업로드 경로] product_no={p_no} path={uploaded_path}")
-
-            # [대표이미지 반영 확인] POST /products/images 요청에는 product_no가 포함되므로
-            # 이 API가 업로드와 상품 연결을 한 번에 처리한다. 실제로 연결용 PUT 후보
-            # 4종(image_upload_type/detail_image 조합, 중첩 구조 등)은 전부 반영되지
-            # 않았으므로 대표이미지를 PUT으로 다시 연결하지 않는다.
-            time.sleep(2)  # 카페24 반영 시차
-            after_upload = _get_product_image_fields(p_no)
-            representative_updated = (
-                bool(after_upload.get('list_image'))
-                and after_upload.get('list_image') != baseline_images.get('list_image')
-            )
-            logger.info(
-                f"[대표이미지 반영 확인] product_no={p_no} 반영여부={representative_updated} "
-                f"before={baseline_images.get('list_image')} after={after_upload.get('list_image')}"
-            )
-            if not representative_updated:
-                logger.error(
-                    f"[대표이미지 미반영] product_no={p_no} 업로드는 201로 성공했으나 "
-                    f"list_image가 그대로다. after={after_upload}"
-                )
-
-            # [추가이미지] 대표이미지와 달리 추가이미지는 PUT으로만 제어할 수 있다.
-            # 조회 응답에서 추가이미지를 읽을 때 쓰는 필드명이 'additional_image'이므로
-            # (위 search_products 참고) 쓰기도 같은 이름을 쓴다. 기존의
-            # {"images": {"add_image": [...]}} 중첩 구조는 카페24가 모르는 필드라
-            # 200을 반환하면서도 조용히 무시했을 가능성이 높다.
-            put_request = {}
-
+            # [추가이미지] 조회 응답에서 추가이미지를 읽을 때 쓰는 필드명이
+            # 'additional_image'이므로(위 search_products 참고) 쓰기도 같은 이름을 쓴다.
+            # 기존의 {"images": {"add_image": [...]}} 중첩 구조는 카페24가 모르는 필드라
+            # 200을 반환하면서도 조용히 무시했다.
             if mode == 'model':
                 # [모델컷 모드] 추가이미지 일괄 삭제
                 put_request["additional_image"] = []
@@ -1322,49 +1285,64 @@ def send_to_cafe24():
                     out_add_file = process_image_bytes(add_resp.content, add_filename, 'product')
                     out_add_path = os.path.join(UPLOAD_FOLDER, out_add_file)
 
-                    ftp_add_url = upload_to_ftp(out_add_path, out_add_file)
-                    processed_add_urls.append(ftp_add_url)
+                    upload_to_ftp(out_add_path, out_add_file, remote_dir=remote_dir)
+                    # 대표이미지와 동일하게 "http:// 절대URL"이 아니라 웹FTP 경로를 넘긴다
+                    # (절대URL 형태는 대표이미지에서 Wrong image path로 거부됐다).
+                    processed_add_urls.append(f"{remote_dir}{out_add_file}")
 
                 put_request["additional_image"] = processed_add_urls
 
-            # 추가이미지 제어가 필요할 때만 PUT을 보낸다 (대표이미지는 위 업로드로 처리됨).
-            put_ok = True
-            put_error = None
-            if put_request:
-                api_url = f"{CAFE24_API_BASE}/products/{p_no}"
-                request_body = {"shop_no": 1, "request": put_request}
-                logger.info(f"[카페24 PUT 요청] product_no={p_no} url={api_url} payload={request_body}")
+            api_url = f"{CAFE24_API_BASE}/products/{p_no}"
+            request_body = {"shop_no": 1, "request": put_request}
+            logger.info(f"[카페24 PUT 요청] product_no={p_no} url={api_url} payload={request_body}")
 
-                res = cafe24_api_request('PUT', api_url, json=request_body, timeout=15)
-                res_json = res.json()
-                logger.info(f"[카페24 응답] product_no={p_no} status={res.status_code} body={res_json}")
+            res = cafe24_api_request('PUT', api_url, json=request_body, timeout=20)
+            res_json = res.json()
+            logger.info(f"[카페24 응답] product_no={p_no} status={res.status_code} body={res_json}")
 
-                if res.status_code != 200:
-                    put_ok = False
-                    put_error = extract_cafe24_error_message(res_json)
-                    logger.error(f"카페24 추가이미지 갱신 실패 (product_no={p_no}): {put_error}")
-            else:
-                logger.info(f"[카페24 PUT 생략] product_no={p_no} 변경할 추가이미지 항목 없음")
+            if res.status_code != 200:
+                err_msg = extract_cafe24_error_message(res_json)
+                logger.error(f"카페24 송신 실패 (product_no={p_no}): {err_msg}")
+                fail_list.append({"product_no": p_no, "reason": err_msg})
+                continue
 
-            if representative_updated and put_ok:
+            # 3. 반영 판정: 카페24는 모르는 필드를 200과 함께 조용히 무시하므로 200만으로는
+            # 부족하다. PUT 응답 본문의 product가 방금 반영된 값을 그대로 돌려주므로 이를
+            # 우선 보고, 아직 안 바뀌었으면 재조회로 한 번 더 확인한다.
+            responded_product = _extract_single_product(res_json) or {}
+            changed_fields = _changed_image_fields(baseline_images, responded_product)
+            current_images = responded_product
+
+            if not changed_fields:
+                time.sleep(2)  # 카페24 반영 시차
+                after_images = _get_product_image_fields(p_no)
+                changed_fields = _changed_image_fields(baseline_images, after_images)
+                current_images = after_images
+
+            logger.info(
+                f"[대표이미지 반영 확인] product_no={p_no} 바뀐필드={changed_fields} "
+                f"before={ {f: baseline_images.get(f) for f in PRODUCT_IMAGE_FIELDS} } "
+                f"after={ {f: current_images.get(f) for f in PRODUCT_IMAGE_FIELDS} }"
+            )
+
+            if changed_fields:
                 success_list.append({
                     "product_no": p_no,
                     "url": f"/static/processed_images/{filename}",
-                    "list_image": after_upload.get('list_image'),
+                    "changed_fields": changed_fields,
+                    "list_image": current_images.get('list_image'),
                 })
                 # 반영된 이미지를 실제로 내려받아 1:1.4 비율인지까지 확인한다
                 # (진단 목적이며 송신 성공/실패 판정에는 영향 없음).
-                verify_image_dimensions(p_no, 'list_image', after_upload.get('list_image'))
+                verify_target = current_images.get('list_image') or current_images.get('detail_image')
+                if verify_target:
+                    verify_image_dimensions(p_no, 'list_image', verify_target)
             else:
-                reasons = []
-                if not representative_updated:
-                    reasons.append(
-                        "대표이미지가 반영되지 않았습니다 (업로드는 201 성공, list_image 변화 없음)"
-                    )
-                if not put_ok:
-                    reasons.append(f"추가이미지 갱신 실패: {put_error}")
-                reason = " / ".join(reasons)
-                logger.error(f"카페24 송신 실패 (product_no={p_no}): {reason}")
+                reason = (
+                    "PUT은 200이지만 이미지 4종(detail/list/small/tiny) 중 어느 것도 "
+                    "새 경로로 바뀌지 않았습니다."
+                )
+                logger.error(f"카페24 송신 실패 (product_no={p_no}): {reason} 응답={res_json}")
                 fail_list.append({"product_no": p_no, "reason": reason})
 
         except Cafe24ReauthRequired as e:

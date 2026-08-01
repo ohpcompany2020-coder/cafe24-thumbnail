@@ -105,12 +105,10 @@
                     </button>
 
                     <!-- [2단계] 카페24 송신 버튼
-                         ※ 상품 이상 사고 조사 중 서버(/api/send-cafe24)에서 차단된 상태.
-                            원인 규명 후 WRITE_ENDPOINTS_ENABLED=true 와 함께 되살릴 것. -->
-                    <button id="sendBtn" disabled
-                        title="상품 이상 사고 조사 중 일시 비활성화되었습니다"
-                        class="px-5 py-2.5 bg-slate-300 text-slate-500 font-bold text-sm rounded-lg shadow-sm flex items-center gap-2 cursor-not-allowed">
-                        <span>🚫</span> <span>2단계: 송신 (일시 중단)</span>
+                         송신 전후로 카테고리를 비교하는 안전장치가 서버에 걸려 있다.
+                         변경이 감지되면 아래 #categoryAlert 영역에 경고가 표시된다. -->
+                    <button id="sendBtn" onclick="runSendToCafe24()" class="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-sm rounded-lg transition-all shadow-sm flex items-center gap-2">
+                        <span>🚀</span> <span>2단계: 카페24로 송신</span>
                     </button>
                 </div>
             </div>
@@ -129,6 +127,18 @@
 
         </div>
         <!-- /상단 고정(sticky) 컨트롤 영역 -->
+
+        <!-- 카테고리 변경 감지 경고 (이미지만 보낸 송신이 카테고리를 건드린 경우) -->
+        <section id="categoryAlert" class="hidden bg-red-600 text-white p-5 rounded-xl shadow-lg space-y-2">
+            <h3 class="text-base font-bold flex items-center gap-2">
+                🚨 카테고리 변경 감지됨 — 확인 필요
+            </h3>
+            <p class="text-sm text-red-50">
+                이미지만 전송했는데 아래 상품의 카테고리(진열 분류)가 바뀌었습니다.
+                추가 송신을 중단하고 카페24 관리자에서 즉시 확인해 주세요.
+            </p>
+            <div id="categoryAlertBody" class="bg-red-700/50 rounded-lg p-3 text-xs font-mono space-y-1"></div>
+        </section>
 
         <!-- 3. 상품 목록 표 (변환 전 vs 변환 후 이미지 리스트 표시) -->
         <section class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
@@ -794,6 +804,30 @@
             };
         }
 
+        // 서버가 보낸 카테고리 변경 경고를 화면 상단 배너에 누적 표시한다.
+        // 이미지만 보낸 송신이 카테고리를 건드렸다는 뜻이므로 즉시 눈에 띄어야 한다.
+        let categoryWarnings = [];
+
+        function reportCategoryWarnings(warnings) {
+            if (!warnings || warnings.length === 0) return;
+
+            categoryWarnings.push(...warnings);
+            const area = document.getElementById('categoryAlert');
+            const body = document.getElementById('categoryAlertBody');
+
+            body.innerHTML = categoryWarnings.map(w => `
+                <div>상품번호 ${w.product_no} —
+                    before: [${(w.category_before || []).join(', ')}] →
+                    after: [${(w.category_after || []).join(', ')}]</div>
+            `).join('');
+            area.classList.remove('hidden');
+            area.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+            console.error('[카테고리 변경 감지]', warnings);
+            alert(`⚠️ 카테고리 변경이 감지되었습니다 (${warnings.length}건).\n`
+                + `추가 송신을 중단하고 카페24 관리자에서 확인해 주세요.`);
+        }
+
         async function sendItemsToCafe24(targets) {
             const sendBtn = document.getElementById('sendBtn');
             sendBtn.disabled = true;
@@ -814,6 +848,7 @@
                         })
                     });
                     const json = await res.json();
+                    reportCategoryWarnings(json.category_warnings);
                     const itemFailure = (json.failures || [])[0];
 
                     if (itemFailure) {

@@ -37,35 +37,36 @@ logger = logging.getLogger(__name__)
 # 카페24에 쓰기 요청을 보낼 수 있는 모든 경로를 차단한다.
 # 원인이 규명되면 WRITE_ENDPOINTS_ENABLED=true 로 다시 열 수 있다.
 #
-# 차단 대상(카페24에 POST/PUT을 보내는 것으로 확인된 경로):
-#   - /api/send-cafe24            : PUT /products/{no}, PUT /products/{no}/additionalimages
-#   - /api/debug/*                : 진단용 POST/PUT (image-register / product-link /
-#                                   additional-image-put) 및 FTP 업로드
-# 차단하지 않는 것(카페24 데이터를 바꾸지 않음):
-#   - /api/products/search        : GET만 사용 (아래 감사 결과 참고)
-#   - /api/convert, /api/download : 이미지 다운로드와 로컬 파일 처리만 수행
-WRITE_ENDPOINTS_ENABLED = os.getenv('WRITE_ENDPOINTS_ENABLED', 'false').lower() == 'true'
-BLOCKED_WRITE_PATHS = ('/api/send-cafe24',)
-BLOCKED_WRITE_PREFIXES = ('/api/debug/',)
+# 송신(/api/send-cafe24)은 카테고리 감시 안전장치를 붙여 다시 열었다.
+# 진단 엔드포인트(/api/debug/*)는 별도 플래그로 계속 막아둔다 - 평상시 운영에 필요하지
+# 않은 데다, additional-image-put-test는 상품의 추가이미지를 실제로 교체해버린다.
+WRITE_ENDPOINTS_ENABLED = os.getenv('WRITE_ENDPOINTS_ENABLED', 'true').lower() == 'true'
+DEBUG_ENDPOINTS_ENABLED = os.getenv('DEBUG_ENDPOINTS_ENABLED', 'false').lower() == 'true'
 
 
 @app.before_request
 def block_write_endpoints():
-    if WRITE_ENDPOINTS_ENABLED:
-        return None
-
     path = request.path
-    blocked = path in BLOCKED_WRITE_PATHS or path.startswith(BLOCKED_WRITE_PREFIXES)
-    if not blocked:
-        return None
 
-    logger.warning(f"[쓰기 엔드포인트 차단] {request.method} {path} - 사고 조사 중 비활성화됨")
-    return jsonify({
-        "success": False,
-        "error": "카페24 데이터를 변경하는 기능이 일시적으로 비활성화되어 있습니다. "
-                 "(상품 이상 사고 조사 중) 검색/변환/다운로드는 정상 사용 가능합니다.",
-        "disabled": True,
-    }), 403
+    if path.startswith('/api/debug/') and not DEBUG_ENDPOINTS_ENABLED:
+        logger.warning(f"[진단 엔드포인트 차단] {request.method} {path}")
+        return jsonify({
+            "success": False,
+            "error": "진단 엔드포인트는 비활성화되어 있습니다. "
+                     "필요하면 DEBUG_ENDPOINTS_ENABLED=true 로 켜 주세요.",
+            "disabled": True,
+        }), 403
+
+    if path == '/api/send-cafe24' and not WRITE_ENDPOINTS_ENABLED:
+        logger.warning(f"[쓰기 엔드포인트 차단] {request.method} {path}")
+        return jsonify({
+            "success": False,
+            "error": "카페24 송신 기능이 일시적으로 비활성화되어 있습니다. "
+                     "검색/변환/다운로드는 정상 사용 가능합니다.",
+            "disabled": True,
+        }), 403
+
+    return None
 
 
 @app.errorhandler(Exception)
@@ -938,6 +939,80 @@ def _changed_image_fields(before, after):
         if new_value and new_value != before.get(field):
             changed.append(field)
     return changed
+
+
+def _normalize_categories(category):
+    """카테고리 값을 비교용으로 정규화한다 (카테고리 번호 문자열 목록, 정렬).
+    조회 실패/형식 불명은 None을 돌려 '비교 불가'로 구분한다."""
+    if category is None:
+        return None
+    if isinstance(category, dict):
+        category = [category]
+    if not isinstance(category, list):
+        return None
+
+    numbers = []
+    for entry in category:
+        if isinstance(entry, dict):
+            value = entry.get('category_no')
+            if value is not None:
+                numbers.append(str(value))
+        elif isinstance(entry, (str, int)):
+            numbers.append(str(entry))
+    return sorted(numbers)
+
+
+def _get_product_categories(product_no):
+    """상품의 현재 카테고리(진열 분류)를 조회한다. 실패하면 None(비교 불가).
+
+    송신 전후로 이 값을 비교해, PUT이 이미지 외 필드까지 건드리는지 감시하기 위한 것."""
+    try:
+        res = cafe24_api_request(
+            'GET', f"{CAFE24_API_BASE}/products/{product_no}",
+            params={"fields": "product_no,category"}, timeout=10
+        )
+        if res.status_code >= 400:
+            logger.warning(f"[카테고리 조회 실패] product_no={product_no} status={res.status_code}")
+            return None
+        product = _extract_single_product(res.json()) or {}
+        return product.get('category')
+    except Exception as e:
+        logger.warning(f"[카테고리 조회 예외] product_no={product_no}: {e}")
+        return None
+
+
+def check_category_side_effect(product_no, category_before, warnings):
+    """PUT 이후 카테고리가 바뀌었는지 확인해 로그와 경고 목록에 남긴다.
+
+    이미지 필드만 보낸 요청이 카테고리까지 건드리면 상품이 쇼핑몰에서 사라질 수 있으므로,
+    쓰기가 한 번이라도 발생한 모든 경로(실패로 중단되는 경우 포함)에서 호출해야 한다."""
+    category_after = _get_product_categories(product_no)
+    before_norm = _normalize_categories(category_before)
+    after_norm = _normalize_categories(category_after)
+
+    logger.info(f"[카테고리 확인] product_no={product_no} before={before_norm} after={after_norm}")
+
+    if before_norm is None or after_norm is None:
+        logger.warning(
+            f"[카테고리 확인] product_no={product_no} 조회 실패로 비교 불가 "
+            f"(before={category_before}, after={category_after})"
+        )
+        return False
+
+    if before_norm == after_norm:
+        return False
+
+    logger.error(
+        f"!!!!! [카테고리 변경 감지] product_no={product_no} - 이미지 필드만 보냈는데 "
+        f"카테고리가 바뀌었습니다. before={before_norm} after={after_norm} "
+        f"즉시 송신을 중단하고 확인하세요 !!!!!"
+    )
+    warnings.append({
+        "product_no": product_no,
+        "category_before": before_norm,
+        "category_after": after_norm,
+    })
+    return True
 
 
 def _get_product_image_fields(product_no):
@@ -2055,6 +2130,8 @@ def send_to_cafe24():
 
     success_list = []
     fail_list = []
+    # 이미지만 보낸 PUT이 카테고리를 건드린 경우를 모아 화면까지 올린다
+    category_warnings = []
 
     for item in items:
         p_no = item.get('product_no')
@@ -2082,6 +2159,11 @@ def send_to_cafe24():
                 f"대표={'포함' if main_filename else '유지(체크 해제)'} "
                 f"추가이미지={len(add_filenames)}장 (상품 보유여부={has_additional_images})"
             )
+
+            # [안전장치] 이미지만 보내는 PUT이 카테고리(진열 분류)까지 건드리는지 감시한다.
+            # 상품이 쇼핑몰에서 "지원하지 않는 상품"이 되는 사고의 재발을 즉시 잡기 위함.
+            category_before = _get_product_categories(p_no)
+            logger.info(f"[카테고리 확인] product_no={p_no} before={category_before}")
 
             changed_fields = []
             current_images = baseline_images
@@ -2118,6 +2200,8 @@ def send_to_cafe24():
                 if res.status_code != 200:
                     err_msg = extract_cafe24_error_message(res_json)
                     logger.error(f"카페24 대표이미지 송신 실패 (product_no={p_no}): {err_msg}")
+                    # 실패해도 PUT은 이미 전송됐으므로 부수효과를 확인한다
+                    check_category_side_effect(p_no, category_before, category_warnings)
                     fail_list.append({"product_no": p_no, "reason": f"대표이미지: {err_msg}"})
                     continue
 
@@ -2145,6 +2229,7 @@ def send_to_cafe24():
                         "새 경로로 바뀌지 않았습니다."
                     )
                     logger.error(f"카페24 대표이미지 송신 실패 (product_no={p_no}): {reason} 응답={res_json}")
+                    check_category_side_effect(p_no, category_before, category_warnings)
                     fail_list.append({"product_no": p_no, "reason": reason})
                     continue
             else:
@@ -2188,6 +2273,7 @@ def send_to_cafe24():
                 if add_res.status_code not in (200, 201):
                     err_msg = extract_cafe24_error_message(add_res_json, '추가이미지 등록 실패')
                     logger.error(f"카페24 추가이미지 송신 실패 (product_no={p_no}): {err_msg}")
+                    check_category_side_effect(p_no, category_before, category_warnings)
                     fail_list.append({"product_no": p_no, "reason": f"추가이미지: {err_msg}"})
                     continue
 
@@ -2208,12 +2294,16 @@ def send_to_cafe24():
                 # 추가이미지가 없는 상품에는 요청 자체를 보내지 않는다 (실수로 지우지 않도록).
                 logger.info(f"[추가이미지 요청 생략] product_no={p_no} 상품에 추가이미지가 없음")
 
+            # 모든 쓰기가 끝난 뒤 카테고리 부수효과를 최종 확인한다
+            category_changed = check_category_side_effect(p_no, category_before, category_warnings)
+
             success_list.append({
                 "product_no": p_no,
                 "main_updated": bool(main_filename),
                 "additional_sent": additional_sent,
                 "changed_fields": changed_fields,
                 "list_image": current_images.get('list_image'),
+                "category_changed": category_changed,
             })
 
             if main_filename:
@@ -2239,10 +2329,16 @@ def send_to_cafe24():
             logger.exception(f"카페24 송신 중 예외 발생 (product_no={p_no})")
             fail_list.append({"product_no": p_no, "reason": str(e)})
 
+    if category_warnings:
+        logger.error(
+            f"!!!!! [카테고리 변경 감지 요약] {len(category_warnings)}건 - {category_warnings} !!!!!"
+        )
+
     return jsonify({
         "success": True,
         "summary": {"total": len(items), "success_count": len(success_list), "fail_count": len(fail_list)},
-        "failures": fail_list
+        "failures": fail_list,
+        "category_warnings": category_warnings,
     })
 
 if __name__ == '__main__':

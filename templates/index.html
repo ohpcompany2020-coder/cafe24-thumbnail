@@ -30,6 +30,12 @@
             </div>
         </header>
 
+        <!-- 상단 고정(sticky) 컨트롤 영역: 검색 + 전체선택/선택반전 + 1·2단계 버튼까지 포함.
+             목록을 아래로 스크롤해도 항상 보이도록 화면 최상단에 붙인다.
+             배경(bg-slate-50)을 채워 아래 상품 목록이 비쳐 보이지 않게 하고,
+             -mx-6/px-6으로 body 좌우 여백까지 배경을 넓혀 툴바처럼 보이게 한다. -->
+        <div class="sticky top-0 z-30 -mx-6 px-6 py-3 bg-slate-50 border-b border-slate-200 shadow-sm space-y-3">
+
         <!-- 1. 상품 검색 영역 -->
         <section class="bg-white p-5 rounded-xl shadow-sm border border-slate-200">
             <h2 class="text-sm font-semibold text-slate-500 uppercase tracking-wider mb-3">1. 상품 검색</h2>
@@ -54,10 +60,19 @@
                         <input type="checkbox" id="selectAll" onchange="toggleSelectAll()" class="w-4 h-4 text-indigo-600 rounded focus:ring-indigo-500">
                         전체 선택
                     </label>
+
+                    <!-- 체크된 이미지와 해제된 이미지를 서로 뒤바꾼다 (화면의 모든 이미지 대상) -->
+                    <button onclick="invertImageSelection()"
+                        class="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 rounded-lg text-sm font-semibold transition-colors">
+                        🔄 선택 반전
+                    </button>
+
                     <div class="h-4 w-px bg-slate-200"></div>
                     <div class="flex items-center gap-2">
-                        <span class="text-sm font-medium text-slate-600">가공 모드:</span>
-                        <select id="processMode" class="px-3 py-1.5 border border-slate-300 rounded-lg text-sm font-semibold bg-indigo-50 text-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                        <span class="text-sm font-medium text-slate-600">가공 모드 일괄:</span>
+                        <select id="processMode" onchange="applyModeToChecked(this.value)"
+                            title="체크된 모든 이미지의 가공모드를 이 값으로 바꿉니다"
+                            class="px-3 py-1.5 border border-slate-300 rounded-lg text-sm font-semibold bg-indigo-50 text-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500">
                             <option value="product">제품컷 (상하 여백 채우기)</option>
                             <option value="model">모델컷 (확대 및 가로 크롭)</option>
                         </select>
@@ -107,6 +122,9 @@
                 </div>
             </div>
         </section>
+
+        </div>
+        <!-- /상단 고정(sticky) 컨트롤 영역 -->
 
         <!-- 3. 상품 목록 표 (변환 전 vs 변환 후 이미지 리스트 표시) -->
         <section class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
@@ -179,9 +197,56 @@
         // }
         let productsData = [];
 
+        // 전체 선택: 상품 행뿐 아니라 모든 이미지 체크박스까지 함께 맞춘다.
+        // (전체선택 후 바로 송신하면 "전부" 반영되는 것이 자연스러운 동작)
         function toggleSelectAll() {
             const isChecked = document.getElementById('selectAll').checked;
             document.querySelectorAll('.product-check').forEach(cb => cb.checked = isChecked);
+            productsData.forEach(p => (p.images || []).forEach(img => { img.checked = isChecked; }));
+            syncImageCheckboxUI();
+        }
+
+        // 선택 반전: 화면의 모든 이미지에 대해 체크/해제를 서로 뒤바꾼다.
+        // "제품컷만 변환 -> 반전 -> 모델컷만 변환" 워크플로우를 위한 것.
+        function invertImageSelection() {
+            if (productsData.length === 0) return;
+            productsData.forEach(p => (p.images || []).forEach(img => { img.checked = !img.checked; }));
+            syncImageCheckboxUI();
+        }
+
+        // 상태(productsData)를 화면 체크박스/카드 스타일에 반영한다.
+        // 전체 재렌더를 하지 않으므로 변환 결과 미리보기가 사라지지 않는다.
+        function syncImageCheckboxUI() {
+            document.querySelectorAll('.image-check').forEach(cb => {
+                const product = findProduct(cb.dataset.productNo);
+                const img = product && (product.images || []).find(i => i.key === cb.dataset.key);
+                if (!img) return;
+                cb.checked = img.checked;
+                applyCardCheckedStyle(cb.dataset.productNo, cb.dataset.key, img.checked);
+            });
+        }
+
+        // 체크된 모든 이미지의 가공모드를 일괄 변경 (상단 "가공 모드 일괄" 드롭다운)
+        function applyModeToChecked(mode) {
+            let count = 0;
+            productsData.forEach(p => (p.images || []).forEach(img => {
+                if (img.checked) {
+                    img.mode = mode;
+                    count++;
+                    const select = document.querySelector(
+                        `.image-mode[data-product-no="${p.product_no}"][data-key="${img.key}"]`);
+                    if (select) select.value = mode;
+                }
+            }));
+            console.log(`[가공모드 일괄 적용] ${mode} -> 체크된 이미지 ${count}장`);
+        }
+
+        // 개별 이미지의 가공모드 변경
+        function setImageMode(productNo, key, mode) {
+            const product = findProduct(productNo);
+            if (!product) return;
+            const img = (product.images || []).find(i => i.key === key);
+            if (img) img.mode = mode;
         }
 
         // GET /api/auth/reauth-url 조회 후 카페24 로그인/권한 승인 페이지를 새 창으로 오픈
@@ -340,6 +405,7 @@
                 label: '대표',
                 source_url: product.image_url,
                 checked: true,
+                mode: 'product',   // 이미지별 가공모드 기본값
                 preview_url: null,
                 processed_filename: null,
                 convert_error: null
@@ -351,6 +417,7 @@
                     label: `추가${idx + 1}`,
                     source_url: url,
                     checked: true,
+                    mode: 'product',
                     preview_url: null,
                     processed_filename: null,
                     convert_error: null
@@ -412,7 +479,10 @@
                 '송신 완료': 'bg-indigo-100 text-indigo-700',
                 '송신 실패': 'bg-red-100 text-red-700'
             };
-            const cls = styles[statusText] || 'bg-slate-100 text-slate-500';
+            // '변환 완료 (3/5)'처럼 뒤에 건수가 붙는 경우도 같은 색을 쓰도록 접두사로 찾는다
+            const cls = styles[statusText]
+                || Object.keys(styles).map(k => statusText.startsWith(k) ? styles[k] : null).find(Boolean)
+                || 'bg-slate-100 text-slate-500';
             return `<span class="px-2 py-1 ${cls} rounded text-xs font-medium">${statusText}</span>`;
         }
 
@@ -526,7 +596,22 @@
                         <span class="text-slate-300 text-xs pb-5">→</span>
                         <div id="${cellId}">${renderPreviewBox(img)}</div>
                     </div>
+                    <select class="image-mode mt-1.5 w-full px-1 py-0.5 border border-slate-300 rounded text-[10px] text-slate-600 focus:outline-none"
+                        data-product-no="${product.product_no}" data-key="${img.key}"
+                        onchange="setImageMode('${product.product_no}', '${img.key}', this.value)">
+                        <option value="product" ${img.mode === 'product' ? 'selected' : ''}>제품컷</option>
+                        <option value="model" ${img.mode === 'model' ? 'selected' : ''}>모델컷</option>
+                    </select>
                 </div>`;
+        }
+
+        function applyCardCheckedStyle(productNo, key, checked) {
+            const card = document.getElementById(`card-${productNo}-${key}`);
+            if (!card) return;
+            card.classList.toggle('border-dashed', !checked);
+            card.classList.toggle('border-slate-300', !checked);
+            card.classList.toggle('opacity-50', !checked);
+            card.classList.toggle('border-slate-200', checked);
         }
 
         function renderPreviewBox(img) {
@@ -548,18 +633,25 @@
             const img = product.images.find(i => i.key === key);
             if (img) img.checked = checked;
 
-            const card = document.getElementById(`card-${productNo}-${key}`);
-            if (card) {
-                card.classList.toggle('border-dashed', !checked);
-                card.classList.toggle('border-slate-300', !checked);
-                card.classList.toggle('opacity-50', !checked);
-                card.classList.toggle('border-slate-200', checked);
-            }
+            applyCardCheckedStyle(productNo, key, checked);
         }
 
         // ==========================================
         // 1단계: 변환실행 (POST /api/convert)
         // ==========================================
+        // 상품 전체(누적) 기준으로 변환 상태를 요약한다. 이번 실행에서 변환한 것만이
+        // 아니라 이전 실행 결과까지 합쳐 판단해야 "누적"이 화면에 제대로 드러난다.
+        function summarizeConvertStatus(product) {
+            const images = product.images || [];
+            const convertedCount = images.filter(i => i.processed_filename).length;
+            const failedCount = images.filter(i => i.convert_error).length;
+
+            if (convertedCount === 0) return '변환 실패';
+            if (failedCount > 0) return '일부 변환 실패';
+            if (convertedCount < images.length) return `변환 완료 (${convertedCount}/${images.length})`;
+            return '변환 완료';
+        }
+
         async function runConvert() {
             const selected = getSelectedProducts();
             if (selected.length === 0) {
@@ -567,7 +659,6 @@
                 return;
             }
 
-            const mode = document.getElementById('processMode').value; // 'product' | 'model'
             const convertBtn = document.getElementById('convertBtn');
             convertBtn.disabled = true;
             convertBtn.classList.add('opacity-50', 'cursor-not-allowed');
@@ -579,7 +670,8 @@
                 // 체크된 이미지만 변환 대상. 체크 해제된 것은 서버로 보내지 않는다.
                 const targetImages = getCheckedImages(product);
                 if (targetImages.length === 0) {
-                    setProductStatus(product.product_no, '변환 실패');
+                    // 체크된 이미지가 없으면 이번엔 아무것도 하지 않는다. 기존 변환 결과를
+                    // 지우거나 실패로 바꾸지 않아야 누적된 결과가 유지된다.
                     console.warn(`[변환 건너뜀] ${product.product_no}: 체크된 이미지가 없습니다.`);
                     done++;
                     setProgress(done, selected.length, '1단계: 썸네일 이미지 변환 중...');
@@ -592,13 +684,13 @@
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
-                            mode: mode,
                             products: [{
                                 product_no: product.product_no,
                                 images: targetImages.map(img => ({
                                     key: img.key,
                                     label: img.label,
-                                    url: img.source_url
+                                    url: img.source_url,
+                                    mode: img.mode || 'product'   // 이미지마다 지정된 가공모드
                                 }))
                             }]
                         })
@@ -607,7 +699,9 @@
                     const result = (json.data || [])[0];
                     const imageResults = (result && result.images) || [];
 
-                    // 이미지별 결과를 각 카드에 반영
+                    // [중요] 이번에 변환한 이미지의 결과만 갱신한다. 체크 해제된 이미지의
+                    // 기존 변환 결과는 건드리지 않으므로, 변환을 여러 번 나눠 실행해도
+                    // 앞서 변환된 결과가 그대로 누적된다.
                     imageResults.forEach(r => {
                         const img = product.images.find(i => i.key === r.key);
                         if (!img) return;
@@ -625,15 +719,7 @@
                         updatePreviewCell(product.product_no, img);
                     });
 
-                    const failCount = (result && result.fail_count) || 0;
-                    if (result && result.status === 'SUCCESS') {
-                        setProductStatus(
-                            product.product_no,
-                            failCount > 0 ? '일부 변환 실패' : '변환 완료'
-                        );
-                    } else {
-                        setProductStatus(product.product_no, '변환 실패');
-                    }
+                    setProductStatus(product.product_no, summarizeConvertStatus(product));
                 } catch (e) {
                     setProductStatus(product.product_no, '변환 실패');
                     console.error(`[변환 요청 오류] ${product.product_no}:`, e);

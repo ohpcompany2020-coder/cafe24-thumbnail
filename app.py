@@ -1831,8 +1831,10 @@ def search_products():
 # [1단계 API] 썸네일 변환 (미리보기 생성)
 @app.route('/api/convert', methods=['POST'])
 def convert_thumbnails():
-    """선택된 이미지(대표/추가)를 모두 같은 가공모드로 1000x1400 변환한다.
+    """선택된 이미지(대표/추가)를 1000x1400으로 변환한다.
 
+    가공모드는 이미지마다 다를 수 있다(같은 상품 안에서 제품컷/모델컷 혼용). 이미지에
+    mode가 없으면 요청 최상위 mode를 기본값으로 쓴다.
     화면에서 체크 해제한 이미지는 아예 넘어오지 않으므로 변환하지 않는다.
 
     JSON 구조 예시:
@@ -1842,8 +1844,8 @@ def convert_thumbnails():
         {
           "product_no": "676",
           "images": [
-            {"key": "main",  "label": "대표",  "url": "https://.../a.jpg"},
-            {"key": "add_0", "label": "추가1", "url": "https://.../b.jpg"}
+            {"key": "main",  "label": "대표",  "url": "https://.../a.jpg", "mode": "product"},
+            {"key": "add_0", "label": "추가1", "url": "https://.../b.jpg", "mode": "model"}
           ]
         }
       ]
@@ -1864,6 +1866,7 @@ def convert_thumbnails():
             key = str(img.get('key') or 'main')
             label = img.get('label') or key
             url = img.get('url')
+            img_mode = img.get('mode') or mode  # 이미지별 가공모드 (없으면 요청 기본값)
 
             try:
                 resp = fetch_image(url, timeout=10)
@@ -1872,12 +1875,13 @@ def convert_thumbnails():
                 ext = os.path.splitext(source_name)[1].lower() or '.jpg'
                 # 상품/이미지별로 파일명을 고정해 재변환 시 같은 파일을 덮어쓰게 한다
                 safe_key = re.sub(r'[^0-9A-Za-z_-]', '_', key)
-                out_file = process_image_bytes(resp.content, f"{p_no}_{safe_key}{ext}", mode)
+                out_file = process_image_bytes(resp.content, f"{p_no}_{safe_key}{ext}", img_mode)
 
                 image_results.append({
                     "key": key,
                     "label": label,
                     "status": "SUCCESS",
+                    "mode": img_mode,
                     "source_url": url,
                     "processed_filename": out_file,
                     "preview_url": f"/static/processed_images/{out_file}",

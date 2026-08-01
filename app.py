@@ -30,6 +30,44 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# ==========================================
+# [긴급 차단] 카페24 데이터를 변경하는 엔드포인트 비활성화
+# ==========================================
+# 조회만 했는데 상품이 쇼핑몰에서 "지원하지 않는 상품"이 된 사고를 조사하는 동안,
+# 카페24에 쓰기 요청을 보낼 수 있는 모든 경로를 차단한다.
+# 원인이 규명되면 WRITE_ENDPOINTS_ENABLED=true 로 다시 열 수 있다.
+#
+# 차단 대상(카페24에 POST/PUT을 보내는 것으로 확인된 경로):
+#   - /api/send-cafe24            : PUT /products/{no}, PUT /products/{no}/additionalimages
+#   - /api/debug/*                : 진단용 POST/PUT (image-register / product-link /
+#                                   additional-image-put) 및 FTP 업로드
+# 차단하지 않는 것(카페24 데이터를 바꾸지 않음):
+#   - /api/products/search        : GET만 사용 (아래 감사 결과 참고)
+#   - /api/convert, /api/download : 이미지 다운로드와 로컬 파일 처리만 수행
+WRITE_ENDPOINTS_ENABLED = os.getenv('WRITE_ENDPOINTS_ENABLED', 'false').lower() == 'true'
+BLOCKED_WRITE_PATHS = ('/api/send-cafe24',)
+BLOCKED_WRITE_PREFIXES = ('/api/debug/',)
+
+
+@app.before_request
+def block_write_endpoints():
+    if WRITE_ENDPOINTS_ENABLED:
+        return None
+
+    path = request.path
+    blocked = path in BLOCKED_WRITE_PATHS or path.startswith(BLOCKED_WRITE_PREFIXES)
+    if not blocked:
+        return None
+
+    logger.warning(f"[쓰기 엔드포인트 차단] {request.method} {path} - 사고 조사 중 비활성화됨")
+    return jsonify({
+        "success": False,
+        "error": "카페24 데이터를 변경하는 기능이 일시적으로 비활성화되어 있습니다. "
+                 "(상품 이상 사고 조사 중) 검색/변환/다운로드는 정상 사용 가능합니다.",
+        "disabled": True,
+    }), 403
+
+
 @app.errorhandler(Exception)
 def handle_unexpected_error(e):
     """API 라우트에서 처리하지 못한 예외가 Flask 기본 HTML 에러 페이지로 새어나가지 않도록

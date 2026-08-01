@@ -104,9 +104,13 @@
                         <span>⬇️</span> <span>다운로드</span>
                     </button>
 
-                    <!-- [2단계] 카페24 송신 버튼 -->
-                    <button id="sendBtn" onclick="runSendToCafe24()" class="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-sm rounded-lg transition-all shadow-sm flex items-center gap-2">
-                        <span>🚀</span> <span>2단계: 카페24로 송신</span>
+                    <!-- [2단계] 카페24 송신 버튼
+                         ※ 상품 이상 사고 조사 중 서버(/api/send-cafe24)에서 차단된 상태.
+                            원인 규명 후 WRITE_ENDPOINTS_ENABLED=true 와 함께 되살릴 것. -->
+                    <button id="sendBtn" disabled
+                        title="상품 이상 사고 조사 중 일시 비활성화되었습니다"
+                        class="px-5 py-2.5 bg-slate-300 text-slate-500 font-bold text-sm rounded-lg shadow-sm flex items-center gap-2 cursor-not-allowed">
+                        <span>🚫</span> <span>2단계: 송신 (일시 중단)</span>
                     </button>
                 </div>
             </div>

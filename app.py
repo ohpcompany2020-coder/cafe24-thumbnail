@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 from flask import Flask, request, jsonify, render_template, send_from_directory, send_file
 from werkzeug.exceptions import HTTPException
 from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
-from PIL import Image, ImageFile, ImageSequence
+from PIL import Image, ImageFile
 
 load_dotenv()
 
@@ -486,35 +486,36 @@ def verify_image_dimensions(product_no, field_name, image_url, expected_ratio=1.
                 )
 
 def process_image_bytes(image_bytes, filename, mode='product'):
-    """GIF Multi-frame / JPG / PNG 처리
+    """원본(JPG/PNG/GIF)을 1000x1400(1:1.4) 정지 이미지로 가공해 항상 JPEG로 저장한다.
 
     mode='product' -> pad_to_1400_ratio (상하 여백 채우기)
     mode='model'   -> crop_to_1400_ratio (확대 후 중앙 가로 크롭)
+
+    GIF는 팔레트(P) 모드나 투명배경(RGBA)일 수 있는데, pad/crop 함수가 내부에서
+    먼저 RGBA로 변환한 뒤 흰 배경 위에 합성하고 다시 RGB로 되돌리므로 이 함수에서
+    별도 convert가 필요 없다. 애니메이션 GIF는 대표 프레임(첫 프레임)만 정지 이미지로
+    쓴다 - 이전에는 이 경우만 save_all=True로 애니메이션 GIF를 그대로 다시 저장했는데,
+    그러면 출력 확장자가 원본(.gif)을 따라가 이후 다운로드/카페24 송신 로직이 기대하는
+    JPG가 아니게 된다. 출력 파일명도 원본 확장자와 무관하게 항상 ".jpg"로 고정한다.
     """
     process_fn = crop_to_1400_ratio if mode == 'model' else pad_to_1400_ratio
 
-    ext = os.path.splitext(filename)[1].lower()
     img = Image.open(io.BytesIO(image_bytes))
-    output_filename = f"processed_{filename}"
+    is_animated = getattr(img, "is_animated", False)
+    if is_animated:
+        img.seek(0)  # 대표 프레임(첫 프레임)만 사용
+
+    logger.info(
+        f"[이미지 변환] filename={filename} format={img.format} mode={img.mode} "
+        f"size={img.size} animated={is_animated}"
+    )
+
+    processed_img = process_fn(img)
+
+    base_name = os.path.splitext(filename)[0]
+    output_filename = f"processed_{base_name}.jpg"
     output_path = os.path.join(UPLOAD_FOLDER, output_filename)
-
-    if ext == '.gif' and getattr(img, "is_animated", False):
-        frames = []
-        durations = []
-        for frame in ImageSequence.Iterator(img):
-            durations.append(frame.info.get('duration', 100))
-            frames.append(process_fn(frame))
-
-        frames[0].save(
-            output_path,
-            save_all=True,
-            append_images=frames[1:],
-            duration=durations,
-            loop=0
-        )
-    else:
-        processed_img = process_fn(img)
-        processed_img.save(output_path, quality=95)
+    processed_img.save(output_path, 'JPEG', quality=95)
 
     return output_filename
 

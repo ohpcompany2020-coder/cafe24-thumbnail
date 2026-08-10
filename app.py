@@ -493,17 +493,18 @@ def process_image_bytes(image_bytes, filename, mode='product'):
 
     GIF는 팔레트(P) 모드나 투명배경(RGBA)일 수 있는데, pad/crop 함수가 내부에서
     먼저 RGBA로 변환한 뒤 흰 배경 위에 합성하고 다시 RGB로 되돌리므로 이 함수에서
-    별도 convert가 필요 없다. 애니메이션 GIF는 대표 프레임(첫 프레임)만 정지 이미지로
-    쓴다 - 이전에는 이 경우만 save_all=True로 애니메이션 GIF를 그대로 다시 저장했는데,
-    그러면 출력 확장자가 원본(.gif)을 따라가 이후 다운로드/카페24 송신 로직이 기대하는
-    JPG가 아니게 된다. 출력 파일명도 원본 확장자와 무관하게 항상 ".jpg"로 고정한다.
+    별도 convert가 필요 없다. 애니메이션 GIF는 대표 프레임(마지막 프레임)만 정지
+    이미지로 쓴다 - 이전에는 이 경우만 save_all=True로 애니메이션 GIF를 그대로 다시
+    저장했는데, 그러면 출력 확장자가 원본(.gif)을 따라가 이후 다운로드/카페24 송신
+    로직이 기대하는 JPG가 아니게 된다. 출력 파일명도 원본 확장자와 무관하게 항상
+    ".jpg"로 고정한다.
     """
     process_fn = crop_to_1400_ratio if mode == 'model' else pad_to_1400_ratio
 
     img = Image.open(io.BytesIO(image_bytes))
     is_animated = getattr(img, "is_animated", False)
     if is_animated:
-        img.seek(0)  # 대표 프레임(첫 프레임)만 사용
+        img.seek(img.n_frames - 1)  # 대표 프레임(마지막 프레임)만 사용
 
     logger.info(
         f"[이미지 변환] filename={filename} format={img.format} mode={img.mode} "

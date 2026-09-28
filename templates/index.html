@@ -8,6 +8,32 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         body { font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, system-ui, Roboto, sans-serif; }
+
+        /* 작업 사이즈 탭: body.m1500이면 1500x1800(다운로드 전용) 화면 */
+        body.m1500 .only1400 { display: none !important; }
+        body:not(.m1500) .only1500 { display: none !important; }
+
+        .size-seg { display: inline-flex; background: #eef1f6; border-radius: 10px; padding: 3px; }
+        .size-seg button { height: 32px; padding: 0 14px; border-radius: 8px; font-size: 12.5px; font-weight: 700; color: #475569; background: transparent; }
+        .size-seg button.on { background: #111827; color: #fff; }
+        body.m1500 .size-seg button.on { background: #d97706; }
+
+        /* 이미지 카드: 선택 강조색은 탭마다 다르다 (① 보라 / ② 주황) */
+        .img-card { flex: 0 0 168px; border: 1.5px solid #e5e9f0; border-radius: 10px; padding: 8px; background: #fff; }
+        .img-card.sel { border-color: #5b4bf0; background: #f8f7ff; }
+        body.m1500 .img-card.sel { border-color: #d97706; background: #fffbeb; }
+        .pv-lbl { font-size: 9.5px; color: #94a3b8; text-align: center; margin-top: 3px; }
+
+        .warn1500 { border-radius: 4px; padding: 1px 5px; font-size: 10px; font-weight: 700; background: #fee2e2; color: #b91c1c; }
+
+        /* 제품컷/모델컷 토글: 제품컷 파랑, 모델컷 분홍 */
+        .cut-toggle { display: flex; margin-top: 8px; background: #eef1f6; border-radius: 8px; padding: 2px; }
+        .cut-toggle button { flex: 1; height: 26px; font-size: 11.5px; font-weight: 700; color: #64748b; background: transparent; border-radius: 6px; }
+        .cut-toggle button.on[data-mode="product"] { background: #2563eb; color: #fff; }
+        .cut-toggle button.on[data-mode="model"] { background: #db2777; color: #fff; }
+
+        .prod-cut-btn { height: 28px; padding: 0 11px; font-size: 11.5px; font-weight: 600; color: #334155; background: #fff; border: 1px solid #d5dbe6; border-radius: 8px; }
+        .prod-cut-btn:hover { background: #f1f5f9; }
     </style>
 </head>
 <body class="bg-slate-50 text-slate-800 p-6">
@@ -21,7 +47,7 @@
                 <p class="text-sm text-slate-500 mt-1">1000x1000px 썸네일을 1000x1400px로 미리 변환하여 검수 후 카페24로 전송합니다.</p>
             </div>
             <div class="flex items-center gap-3">
-                <div class="text-xs font-mono bg-indigo-50 text-indigo-600 px-3 py-1.5 rounded-full border border-indigo-100">
+                <div id="targetBadge" class="text-xs font-mono bg-indigo-50 text-indigo-600 px-3 py-1.5 rounded-full border border-indigo-100">
                     Target: 1000x1400 px (JPG/PNG/GIF)
                 </div>
                 <button id="reauthBtn" onclick="openCafe24Reauth()" class="text-xs font-semibold bg-amber-50 hover:bg-amber-100 text-amber-700 px-3 py-1.5 rounded-full border border-amber-200 transition-colors flex items-center gap-1">
@@ -55,7 +81,18 @@
         <!-- 2. 컨트롤 영역 (1단계: 변환실행 / 2단계: 카페24로 송신) -->
         <section class="bg-white p-4 rounded-xl shadow-sm border border-slate-200 space-y-4">
             <div class="flex flex-wrap justify-between items-center gap-4">
-                <div class="flex items-center gap-4">
+                <div class="flex flex-wrap items-center gap-4">
+                    <!-- 작업 사이즈 탭: 페이지 이동 없이 같은 화면에서 전환한다 (조회 결과/체크/컷 선택 유지) -->
+                    <div class="flex items-center gap-2">
+                        <span class="text-sm font-bold text-slate-700">작업 사이즈</span>
+                        <div class="size-seg" id="sizeSeg">
+                            <button type="button" class="on" data-size="1400" onclick="setWorkSize('1400')">① 1000x1400 · 카페24 송신용</button>
+                            <button type="button" data-size="1500" onclick="setWorkSize('1500')">② 1500x1800 · 다운로드 전용</button>
+                        </div>
+                    </div>
+
+                    <div class="h-4 w-px bg-slate-200"></div>
+
                     <label class="flex items-center gap-2 text-sm font-medium cursor-pointer">
                         <input type="checkbox" id="selectAll" onchange="toggleSelectAll()" class="w-4 h-4 text-indigo-600 rounded focus:ring-indigo-500">
                         전체 선택
@@ -71,8 +108,9 @@
                     <div class="flex items-center gap-2">
                         <span class="text-sm font-medium text-slate-600">가공 모드 일괄:</span>
                         <select id="processMode" onchange="applyModeToChecked(this.value)"
-                            title="체크된 모든 이미지의 가공모드를 이 값으로 바꿉니다"
+                            title="체크된 모든 이미지의 가공모드를 이 값으로 바꿉니다 (바꾼 이미지는 다시 변환해야 합니다)"
                             class="px-3 py-1.5 border border-slate-300 rounded-lg text-sm font-semibold bg-indigo-50 text-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500">
+                            <option value="" selected>일괄 적용 안 함</option>
                             <option value="product">제품컷 (상하 여백 채우기)</option>
                             <option value="model">모델컷 (확대 및 가로 크롭)</option>
                         </select>
@@ -96,6 +134,15 @@
                         <option value="desc">등록역순</option>
                     </select>
 
+                    <!-- ② 1500x1800 탭: 변환 + 다운로드 버튼 하나뿐이다. 송신 버튼/로직은 없다. -->
+                    <div class="only1500 flex items-center gap-3">
+                        <button id="convert1500Btn" onclick="runConvertAndDownload1500()" class="px-5 py-2.5 bg-amber-600 hover:bg-amber-700 text-white font-bold text-sm rounded-lg transition-all shadow-sm flex items-center gap-2">
+                            <span>📐</span> <span>선택 이미지 1500x1800 변환 + 다운로드</span>
+                        </button>
+                        <span class="text-xs text-slate-500">카페24로는 전송되지 않습니다 · 송신 버튼 없음</span>
+                    </div>
+
+                    <div class="only1400 flex items-center gap-3">
                     <!-- [1단계] 변환실행 버튼 -->
                     <button id="convertBtn" onclick="runConvert()" class="px-5 py-2.5 bg-slate-800 hover:bg-slate-900 text-white font-bold text-sm rounded-lg transition-all shadow-sm flex items-center gap-2">
                         <span>🎨</span> <span>1단계: 변환실행</span>
@@ -112,7 +159,17 @@
                     <button id="sendBtn" onclick="runSendToCafe24()" class="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-sm rounded-lg transition-all shadow-sm flex items-center gap-2">
                         <span>🚀</span> <span>2단계: 카페24로 송신</span>
                     </button>
+                    </div>
                 </div>
+            </div>
+
+            <!-- ② 탭에서만 보이는 변환 규칙 안내 (1000x1000 원본 기준) -->
+            <div class="only1500 rounded-lg border border-amber-300 bg-amber-50 px-4 py-2.5 text-xs leading-relaxed text-slate-700">
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-2">
+                    <div><b class="text-amber-700">1:1 원본 · 제품컷</b> · 1500x1500 확대 후 위아래 150px 흰색 여백 → <b>1500x1800</b></div>
+                    <div><b class="text-amber-700">1:1 원본 · 모델컷</b> · 1800x1800 확대 후 가로 중앙 1500px 크롭 → <b>1500x1800</b></div>
+                </div>
+                <div class="mt-1 text-slate-500">원본이 1000x1400(1:1.4)이면 위·아래 각 100px을 잘라 1000x1200 → 1.5배 확대 → <b>1500x1800</b> (제품컷/모델컷 동일). 1:1 원본은 위 규칙, 그 외 비율은 변환하지 않고 "지원하지 않는 원본 비율"로 표시합니다.</div>
             </div>
 
             <!-- 진행 상태 및 진행률 바 (Progress Bar) -->
@@ -131,7 +188,7 @@
         <!-- /상단 고정(sticky) 컨트롤 영역 -->
 
         <!-- 카테고리 변경 감지 경고 (이미지만 보낸 송신이 카테고리를 건드린 경우) -->
-        <section id="categoryAlert" class="hidden bg-red-600 text-white p-5 rounded-xl shadow-lg space-y-2">
+        <section id="categoryAlert" class="only1400 hidden bg-red-600 text-white p-5 rounded-xl shadow-lg space-y-2">
             <h3 class="text-base font-bold flex items-center gap-2">
                 🚨 카테고리 변경 감지됨 — 확인 필요
             </h3>
@@ -158,7 +215,7 @@
         </section>
 
         <!-- 4. 실패 상품 리스트 (실패 시에만 노출) -->
-        <section id="failureArea" class="hidden bg-red-50 p-5 rounded-xl border border-red-200 space-y-3">
+        <section id="failureArea" class="only1400 hidden bg-red-50 p-5 rounded-xl border border-red-200 space-y-3">
             <div class="flex justify-between items-center">
                 <h3 class="text-sm font-bold text-red-700 flex items-center gap-2">
                     ⚠️ 카페24 송신 실패 상품 목록 (<span id="failCount">0</span>건)
@@ -273,27 +330,148 @@
             }
         }
 
-        // 체크된 모든 이미지의 가공모드를 일괄 변경 (상단 "가공 모드 일괄" 드롭다운)
-        function applyModeToChecked(mode) {
-            let count = 0;
-            productsData.forEach(p => (p.images || []).forEach(img => {
-                if (img.checked) {
-                    img.mode = mode;
-                    count++;
-                    const select = document.querySelector(
-                        `.image-mode[data-product-no="${p.product_no}"][data-key="${img.key}"]`);
-                    if (select) select.value = mode;
-                }
-            }));
-            console.log(`[가공모드 일괄 적용] ${mode} -> 체크된 이미지 ${count}장`);
+        // ==========================================
+        // 작업 사이즈 탭 ('1400' 카페24 송신용 | '1500' 다운로드 전용)
+        // ==========================================
+        // 조회 결과, 체크 상태, 컷(제품컷/모델컷) 선택은 두 탭이 공유한다. 사이즈별로 따로
+        // 갖는 것은 변환 결과뿐이다: 1400은 이미지 객체의 기존 필드(preview_url,
+        // processed_filename, convert_error), 1500은 img.r1500 안의 같은 이름 필드.
+        let workSize = '1400';
+
+        function getResult(img, size) {
+            return size === '1500' ? img.r1500 : img;
         }
 
-        // 개별 이미지의 가공모드 변경
-        function setImageMode(productNo, key, mode) {
+        function statusOf(product, size) {
+            return size === '1500' ? product.status1500 : product.status;
+        }
+
+        function setWorkSize(size) {
+            workSize = size === '1500' ? '1500' : '1400';
+            document.body.classList.toggle('m1500', workSize === '1500');
+            document.querySelectorAll('#sizeSeg button').forEach(b =>
+                b.classList.toggle('on', b.dataset.size === workSize));
+
+            const badge = document.getElementById('targetBadge');
+            if (badge) {
+                badge.innerText = workSize === '1500'
+                    ? 'Target: 1500x1800 px (JPG/PNG)'
+                    : 'Target: 1000x1400 px (JPG/PNG/GIF)';
+            }
+            // 진행 단계 표시는 탭의 사이즈 기준이다
+            productsData.forEach(p => {
+                const cell = document.getElementById(`status-cell-${p.product_no}`);
+                if (cell) cell.innerHTML = statusBadge(statusOf(p, workSize));
+            });
+        }
+
+        // 컷 변경 시 이미 만들어 둔 변환 결과는 더 이상 맞지 않으므로 두 사이즈 모두 지운다.
+        // (오래된 컷의 결과가 송신/다운로드에 섞이는 것을 막는다)
+        function invalidateResults(product, img) {
+            [img, img.r1500].forEach(r => {
+                r.preview_url = null;
+                r.processed_filename = null;
+                r.convert_error = null;
+                r.unsupported_ratio = false;
+            });
+            updatePreviewCellSize(product.product_no, img, '1400');
+            updatePreviewCellSize(product.product_no, img, '1500');
+            refreshProductStatus(product);
+        }
+
+        function syncCutButtons(productNo, img) {
+            const wrap = document.querySelector(
+                `.cut-toggle[data-product-no="${productNo}"][data-key="${img.key}"]`);
+            if (!wrap) return;
+            wrap.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.mode === img.mode));
+        }
+
+        // 개별 이미지의 컷 변경: 현재 탭 사이즈로 미리보기를 다시 만든다.
+        function setImageCut(productNo, key, mode) {
+            const product = findProduct(productNo);
+            const img = product && (product.images || []).find(i => i.key === key);
+            if (!img || img.mode === mode) return;
+
+            img.mode = mode;
+            syncCutButtons(productNo, img);
+            invalidateResults(product, img);
+            enqueueRegen(product, img);
+        }
+
+        // 상품 헤더의 "이 상품 전체 [제품컷][모델컷]": 모든 이미지의 컷을 바꾸고 미리보기를 다시 만든다.
+        function setProductCut(productNo, mode) {
             const product = findProduct(productNo);
             if (!product) return;
-            const img = (product.images || []).find(i => i.key === key);
-            if (img) img.mode = mode;
+            (product.images || []).forEach(img => setImageCut(productNo, img.key, mode));
+        }
+
+        // 체크된 모든 이미지의 가공모드를 일괄 변경 (상단 "가공 모드 일괄" 드롭다운).
+        // 수십~수백 장이 한꺼번에 서버 변환을 타지 않도록 미리보기는 자동으로 만들지 않는다.
+        // 바꾼 이미지는 미변환 상태가 되므로 변환 버튼(또는 받기)으로 다시 변환한다.
+        function applyModeToChecked(mode) {
+            const select = document.getElementById('processMode');
+            if (select) select.value = '';   // 같은 값을 다시 적용할 수 있게 되돌린다
+            if (!mode) return;
+
+            let count = 0;
+            productsData.forEach(p => (p.images || []).forEach(img => {
+                if (!img.checked || img.mode === mode) return;
+                img.mode = mode;
+                count++;
+                syncCutButtons(p.product_no, img);
+                invalidateResults(p, img);
+            }));
+            console.log(`[가공모드 일괄 적용] ${mode} -> 체크된 이미지 ${count}장 (다시 변환 필요)`);
+        }
+
+        // ------------------------------------------
+        // 미리보기 재생성 큐
+        // ------------------------------------------
+        // 같은 파일명을 덮어쓰는 서버 변환이 겹치면 늦게 끝난 옛 요청이 결과를 덮을 수 있어
+        // 한 번에 하나씩 순서대로 처리한다. 같은 이미지가 대기 중이면 중복해서 넣지 않는다.
+        const regenQueue = [];
+        let regenRunning = false;
+
+        function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+        function isBatchBusy() {
+            return ['convertBtn', 'convert1500Btn'].some(id => {
+                const el = document.getElementById(id);
+                return el && el.disabled;
+            });
+        }
+
+        async function waitRegenIdle() {
+            while (regenRunning || regenQueue.length > 0) await sleep(150);
+        }
+
+        function enqueueRegen(product, img) {
+            const size = workSize;
+            const id = `${product.product_no}|${img.key}|${size}`;
+            const target = getResult(img, size);
+            target.pending = true;
+            updatePreviewCellSize(product.product_no, img, size);
+            refreshProductStatus(product);
+
+            if (!regenQueue.some(job => job.id === id)) {
+                regenQueue.push({ id, product, img, size });
+            }
+            runRegenQueue();
+        }
+
+        async function runRegenQueue() {
+            if (regenRunning) return;
+            regenRunning = true;
+            try {
+                while (regenQueue.length > 0) {
+                    // 상단 변환 버튼이 배치 작업 중이면 끝날 때까지 기다린다
+                    while (isBatchBusy()) await sleep(200);
+                    const job = regenQueue.shift();
+                    await convertImages(job.product, [job.img], job.size);
+                }
+            } finally {
+                regenRunning = false;
+            }
         }
 
         // GET /api/auth/reauth-url 조회 후 카페24 로그인/권한 승인 페이지를 새 창으로 오픈
@@ -408,7 +586,8 @@
                     const newProducts = (json.data || []).map(p => ({
                         ...p,
                         images: buildImageList(p),
-                        status: '조회 완료'
+                        status: '조회 완료',        // 1000x1400 진행 단계
+                        status1500: '조회 완료'     // 1500x1800 진행 단계
                     }));
                     const startIndex = productsData.length;
                     productsData.push(...newProducts);
@@ -453,32 +632,25 @@
         // 각 이미지는 개별 체크박스를 가지며 기본값은 선택 안 됨이다. (조회 직후 상품이
         // 전부 선택돼 있으면 "전체 송신"이 한 번의 클릭으로 되어 버리기 때문)
         function buildImageList(product) {
-            const images = [{
-                key: 'main',
-                label: '대표',
-                source_url: product.image_url,
+            const newImage = (key, label, url) => ({
+                key,
+                label,
+                source_url: url,
                 checked: false,
                 ratio: null,
-                mode: 'product',   // 이미지별 가공모드 기본값
+                mode: 'product',   // 이미지별 컷 기본값 (두 작업 사이즈가 공유)
+                // 1000x1400 변환 결과
                 preview_url: null,
                 processed_filename: null,
-                convert_error: null
-            }];
-
-            (product.add_images || []).forEach((url, idx) => {
-                images.push({
-                    key: `add_${idx}`,
-                    label: `추가${idx + 1}`,
-                    source_url: url,
-                    checked: false,
-                    ratio: null,
-                    mode: 'product',
-                    preview_url: null,
-                    processed_filename: null,
-                    convert_error: null
-                });
+                convert_error: null,
+                // 1500x1800 변환 결과 (다운로드 전용, 송신 대상이 아님)
+                r1500: { preview_url: null, processed_filename: null, convert_error: null, unsupported_ratio: false }
             });
 
+            const images = [newImage('main', '대표', product.image_url)];
+            (product.add_images || []).forEach((url, idx) => {
+                images.push(newImage(`add_${idx}`, `추가${idx + 1}`, url));
+            });
             return images;
         }
 
@@ -521,11 +693,31 @@
             if (label) document.getElementById('stepStatus').innerText = label;
         }
 
+        // 1000x1400 진행 단계 (기존 변환/송신 흐름이 사용). 화면에는 1400 탭일 때만 반영한다.
         function setProductStatus(productNo, statusText) {
+            setProductStatusFor(productNo, '1400', statusText);
+        }
+
+        function setProductStatusFor(productNo, size, statusText) {
             const product = findProduct(productNo);
-            if (product) product.status = statusText;
+            if (product) {
+                if (size === '1500') product.status1500 = statusText;
+                else product.status = statusText;
+            }
+            if (size !== workSize) return;
             const cell = document.getElementById(`status-cell-${productNo}`);
             if (cell) cell.innerHTML = statusBadge(statusText);
+        }
+
+        // 변환 결과가 모두 사라진(컷 변경 등) 상품은 '조회 완료'로 되돌리고, 아니면 결과 기준으로 요약한다.
+        function refreshProductStatus(product) {
+            ['1400', '1500'].forEach(size => {
+                const results = (product.images || []).map(i => getResult(i, size));
+                let text = '조회 완료';
+                if (results.some(r => r.pending)) text = '변환 중...';
+                else if (results.some(r => r.processed_filename || r.convert_error)) text = summarizeConvertStatus(product, size);
+                setProductStatusFor(product.product_no, size, text);
+            });
         }
 
         function statusBadge(statusText) {
@@ -549,9 +741,15 @@
         // 이미지 1장의 변환 결과 미리보기 칸만 갱신한다.
         // (renderPreviewBox가 캐시 무효화용 타임스탬프를 붙이므로 재변환 시에도 즉시 반영됨)
         function updatePreviewCell(productNo, img) {
-            const cell = document.getElementById(`preview-${productNo}-${img.key}`);
+            updatePreviewCellSize(productNo, img, '1400');
+        }
+
+        // 사이즈별 미리보기 칸 갱신. 1400은 기존 id(preview-...), 1500은 preview1500-... 를 쓴다.
+        function updatePreviewCellSize(productNo, img, size) {
+            const prefix = size === '1500' ? 'preview1500' : 'preview';
+            const cell = document.getElementById(`${prefix}-${productNo}-${img.key}`);
             if (!cell) return;
-            cell.innerHTML = renderPreviewBox(img);
+            cell.innerHTML = renderPreviewBox(img, size);
         }
 
         // ==========================================
@@ -646,8 +844,12 @@
                             <span class="font-semibold text-slate-800">${escapeHtml(p.product_name)}</span>
                             <span class="text-xs text-slate-400 ml-2">${modelAndCode}</span>
                         </div>
+                        <span class="flex items-center gap-1 text-xs text-slate-500">이 상품 전체
+                            <button type="button" class="prod-cut-btn" onclick="setProductCut('${p.product_no}', 'product')">제품컷</button>
+                            <button type="button" class="prod-cut-btn" onclick="setProductCut('${p.product_no}', 'model')">모델컷</button>
+                        </span>
                         <span class="text-[11px] text-slate-500">이미지 ${p.images.length}장 (대표 1 + 추가 ${addCount})</span>
-                        <span id="status-cell-${p.product_no}">${statusBadge(p.status)}</span>
+                        <span id="status-cell-${p.product_no}">${statusBadge(statusOf(p, workSize))}</span>
                         <button onclick="downloadProduct('${p.product_no}')"
                             class="px-2.5 py-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 rounded text-xs font-semibold transition-colors">
                             ⬇️ 받기
@@ -679,6 +881,13 @@
             return `<span class="px-1 py-0.5 rounded text-[9px] font-semibold ${styles[ratio] || styles['확인불가']}">${ratio}</span>`;
         }
 
+        // 비율 라벨 + (1500x1800 탭에서만 보이는) "지원하지 않는 원본 비율" 경고.
+        // 1:1과 1:1.4(5:7)만 지원한다.
+        function ratioSlotHtml(img) {
+            return ratioBadge(img.ratio)
+                + (img.ratio === '기타' ? '<span class="warn1500 only1500">지원하지 않는 원본 비율</span>' : '');
+        }
+
         // 원본 <img>의 onload/onerror에서 호출 - 결과를 상태에 저장해 두므로 다시 그려도 유지된다.
         function onSourceImageLoaded(imgEl, productNo, key, failed) {
             const product = findProduct(productNo);
@@ -687,7 +896,7 @@
 
             img.ratio = failed ? '확인불가' : classifyRatio(imgEl.naturalWidth, imgEl.naturalHeight);
             const slot = document.getElementById(`ratio-${productNo}-${key}`);
-            if (slot) slot.innerHTML = ratioBadge(img.ratio);
+            if (slot) slot.innerHTML = ratioSlotHtml(img);
         }
 
         // 이미지 1장 카드: 체크박스 + 역할(대표/추가N) + 비율 라벨 + 원본 썸네일 + 변환 결과 미리보기
@@ -698,52 +907,65 @@
                 ? 'bg-indigo-100 text-indigo-700 border-indigo-200'
                 : 'bg-slate-100 text-slate-600 border-slate-200';
 
+            const cell1500Id = `preview1500-${product.product_no}-${img.key}`;
+
             return `
-                <div class="shrink-0 border ${img.checked ? 'border-slate-200' : 'border-dashed border-slate-300 opacity-50'} rounded-lg p-2 bg-white"
-                     id="card-${product.product_no}-${img.key}">
-                    <label class="flex items-center gap-1.5 cursor-pointer mb-1.5">
+                <div class="img-card ${img.checked ? 'sel' : ''}" id="card-${product.product_no}-${img.key}">
+                    <label class="flex flex-wrap items-center gap-1.5 cursor-pointer mb-1.5">
                         <input type="checkbox" class="image-check w-3.5 h-3.5 rounded"
                             data-product-no="${product.product_no}" data-key="${img.key}"
                             ${img.checked ? 'checked' : ''}
                             onchange="toggleImageChecked('${product.product_no}', '${img.key}', this.checked)">
                         <span class="px-1.5 py-0.5 border ${labelClass} rounded text-[10px] font-bold">${img.label}</span>
-                        <span id="ratio-${product.product_no}-${img.key}">${ratioBadge(img.ratio)}</span>
+                        <span id="ratio-${product.product_no}-${img.key}" class="flex items-center gap-1">${ratioSlotHtml(img)}</span>
                     </label>
-                    <div class="flex items-end gap-1">
-                        <img src="${escapeHtml(img.source_url)}" alt="${img.label} 원본" loading="lazy" decoding="async"
-                            onload="onSourceImageLoaded(this, '${product.product_no}', '${img.key}', false)"
-                            onerror="onSourceImageLoaded(this, '${product.product_no}', '${img.key}', true)"
-                            class="w-14 h-14 object-cover rounded border border-slate-200 bg-slate-100">
-                        <span class="text-slate-300 text-xs pb-5">→</span>
-                        <div id="${cellId}">${renderPreviewBox(img)}</div>
+                    <div class="flex items-center justify-center gap-1.5">
+                        <div>
+                            <img src="${escapeHtml(img.source_url)}" alt="${img.label} 원본" loading="lazy" decoding="async"
+                                onload="onSourceImageLoaded(this, '${product.product_no}', '${img.key}', false)"
+                                onerror="onSourceImageLoaded(this, '${product.product_no}', '${img.key}', true)"
+                                class="w-14 h-14 object-cover rounded border border-slate-200 bg-slate-100">
+                            <div class="pv-lbl">원본</div>
+                        </div>
+                        <span class="text-slate-300 text-xs">→</span>
+                        <div>
+                            <div id="${cellId}" class="only1400">${renderPreviewBox(img, '1400')}</div>
+                            <div id="${cell1500Id}" class="only1500">${renderPreviewBox(img, '1500')}</div>
+                            <div class="pv-lbl"><span class="only1400">1000x1400</span><span class="only1500">1500x1800</span></div>
+                        </div>
                     </div>
-                    <select class="image-mode mt-1.5 w-full px-1 py-0.5 border border-slate-300 rounded text-[10px] text-slate-600 focus:outline-none"
-                        data-product-no="${product.product_no}" data-key="${img.key}"
-                        onchange="setImageMode('${product.product_no}', '${img.key}', this.value)">
-                        <option value="product" ${img.mode === 'product' ? 'selected' : ''}>제품컷</option>
-                        <option value="model" ${img.mode === 'model' ? 'selected' : ''}>모델컷</option>
-                    </select>
+                    <div class="cut-toggle" data-product-no="${product.product_no}" data-key="${img.key}">
+                        <button type="button" data-mode="product" class="${img.mode === 'product' ? 'on' : ''}"
+                            onclick="setImageCut('${product.product_no}', '${img.key}', 'product')">제품컷</button>
+                        <button type="button" data-mode="model" class="${img.mode === 'model' ? 'on' : ''}"
+                            onclick="setImageCut('${product.product_no}', '${img.key}', 'model')">모델컷</button>
+                    </div>
                 </div>`;
         }
 
+        // 선택된 카드는 탭 색상(보라/주황)으로 강조한다 (색은 CSS의 .img-card.sel)
         function applyCardCheckedStyle(productNo, key, checked) {
             const card = document.getElementById(`card-${productNo}-${key}`);
-            if (!card) return;
-            card.classList.toggle('border-dashed', !checked);
-            card.classList.toggle('border-slate-300', !checked);
-            card.classList.toggle('opacity-50', !checked);
-            card.classList.toggle('border-slate-200', checked);
+            if (card) card.classList.toggle('sel', checked);
         }
 
-        function renderPreviewBox(img) {
-            if (img.preview_url) {
-                return `<img src="${img.preview_url}?t=${Date.now()}" alt="변환 결과"
-                    class="w-14 h-[78.4px] object-cover rounded border border-indigo-200 bg-white">`;
+        // 변환 결과 미리보기 칸. 1000x1400은 5:7, 1500x1800은 5:6 비율이다.
+        function renderPreviewBox(img, size = '1400') {
+            const r = getResult(img, size);
+            const dims = size === '1500' ? 'w-[62px] h-[74px]' : 'w-14 h-[78.4px]';
+
+            if (r.pending) {
+                return `<div class="${dims} bg-amber-50 border border-amber-200 rounded flex items-center justify-center text-[9px] text-amber-600 font-semibold">변환 중</div>`;
             }
-            if (img.convert_error) {
-                return `<div class="w-14 h-[78.4px] bg-red-50 border border-red-200 rounded flex items-center justify-center text-[9px] text-red-500 text-center px-0.5">변환<br>실패</div>`;
+            if (r.preview_url) {
+                return `<img src="${r.preview_url}?t=${Date.now()}" alt="변환 결과" loading="lazy"
+                    class="${dims} object-cover rounded border border-indigo-200 bg-white">`;
             }
-            return `<div class="w-14 h-[78.4px] bg-indigo-100/50 border border-indigo-200 rounded flex items-center justify-center text-[9px] text-indigo-400 font-mono">미변환</div>`;
+            if (r.convert_error) {
+                const text = r.unsupported_ratio ? '지원 안 함<br>원본 비율' : '변환<br>실패';
+                return `<div class="${dims} bg-red-50 border border-red-200 rounded flex items-center justify-center text-[9px] text-red-500 text-center px-0.5" title="${escapeHtml(r.convert_error)}">${text}</div>`;
+            }
+            return `<div class="${dims} bg-indigo-100/50 border border-indigo-200 rounded flex items-center justify-center text-[9px] text-indigo-400 font-mono">미변환</div>`;
         }
 
         // 이미지 체크 상태 변경 - 상태만 갱신하고 카드 테두리만 바꾼다 (전체 재렌더 방지)
@@ -764,10 +986,10 @@
         // ==========================================
         // 상품 전체(누적) 기준으로 변환 상태를 요약한다. 이번 실행에서 변환한 것만이
         // 아니라 이전 실행 결과까지 합쳐 판단해야 "누적"이 화면에 제대로 드러난다.
-        function summarizeConvertStatus(product) {
+        function summarizeConvertStatus(product, size = '1400') {
             const images = product.images || [];
-            const convertedCount = images.filter(i => i.processed_filename).length;
-            const failedCount = images.filter(i => i.convert_error).length;
+            const convertedCount = images.filter(i => getResult(i, size).processed_filename).length;
+            const failedCount = images.filter(i => getResult(i, size).convert_error).length;
 
             if (convertedCount === 0) return '변환 실패';
             if (failedCount > 0) return '일부 변환 실패';
@@ -858,9 +1080,170 @@
         }
 
         // ==========================================
+        // 사이즈별 변환 (미리보기 재생성 / 받기 / 1500x1800 변환+다운로드 공용)
+        // ==========================================
+        // 1400은 기존 /api/convert, 1500은 /api/convert-1500을 호출한다. 결과는 사이즈별
+        // 필드(getResult)에 저장하며, 1400 결과는 기존 변환실행과 같은 필드를 쓴다.
+        function applyConvertResult(product, size, r) {
+            const img = product.images.find(i => i.key === r.key);
+            if (!img) return;
+
+            // 응답을 기다리는 사이에 컷이 바뀌었으면 옛 컷의 결과이므로 버린다 (새 요청이 대기 중)
+            if (r.status === 'SUCCESS' && r.mode && r.mode !== img.mode) return;
+
+            const target = getResult(img, size);
+            target.pending = false;
+            if (r.status === 'SUCCESS') {
+                target.preview_url = r.preview_url;
+                target.processed_filename = r.processed_filename;
+                target.convert_error = null;
+                target.unsupported_ratio = false;
+            } else {
+                target.preview_url = null;
+                target.processed_filename = null;
+                target.convert_error = r.error || '변환 실패';
+                target.unsupported_ratio = !!r.unsupported_ratio;
+                console.error(`[변환 실패] ${product.product_no} ${r.label} (${size}):`, r.error);
+            }
+            updatePreviewCellSize(product.product_no, img, size);
+        }
+
+        async function convertImages(product, images, size) {
+            if (images.length === 0) return;
+
+            images.forEach(img => { getResult(img, size).pending = true; });
+            images.forEach(img => updatePreviewCellSize(product.product_no, img, size));
+            setProductStatusFor(product.product_no, size, '변환 중...');
+
+            try {
+                const res = await fetch(size === '1500' ? '/api/convert-1500' : '/api/convert', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        products: [{
+                            product_no: product.product_no,
+                            images: images.map(img => ({
+                                key: img.key,
+                                label: img.label,
+                                url: img.source_url,
+                                mode: img.mode || 'product'
+                            }))
+                        }]
+                    })
+                });
+                const json = await res.json();
+                const imageResults = ((json.data || [])[0] || {}).images || [];
+
+                images.forEach(img => {
+                    if (!imageResults.some(r => r.key === img.key)) {
+                        imageResults.push({ key: img.key, label: img.label, status: 'FAIL', error: json.error || '응답에 결과가 없습니다.' });
+                    }
+                });
+                imageResults.forEach(r => applyConvertResult(product, size, r));
+            } catch (e) {
+                console.error(`[변환 요청 오류] ${product.product_no} (${size}):`, e);
+                images.forEach(img => applyConvertResult(product, size, {
+                    key: img.key, label: img.label, status: 'FAIL', error: e.message || '네트워크 오류'
+                }));
+            }
+
+            refreshProductStatus(product);
+        }
+
+        // 체크된 이미지 중 현재 사이즈 변환 결과가 없는 것만 변환한다.
+        async function ensureConverted(product, size) {
+            const missing = getCheckedImages(product).filter(img => !getResult(img, size).processed_filename);
+            await convertImages(product, missing, size);
+        }
+
+        // 체크되어 있고 해당 사이즈로 변환까지 끝난 이미지만 ZIP에 담는다.
+        // 1500x1800 파일은 이름에 _1500x1800을 붙여 1000x1400 결과와 구분한다.
+        function toSizeDownloadItem(product, size) {
+            return {
+                product_code: product.product_code || product.product_no,
+                product_no: product.product_no,
+                images: getCheckedImages(product)
+                    .filter(img => getResult(img, size).processed_filename)
+                    .map(img => ({
+                        label: size === '1500' ? `${img.label}_1500x1800` : img.label,
+                        filename: getResult(img, size).processed_filename
+                    }))
+            };
+        }
+
+        // 변환한 뒤 ZIP으로 내려받는다. 실패한 이미지는 ZIP에서 빠지며 사유를 알려 준다.
+        async function downloadConvertedProducts(products, size) {
+            const failed = [];
+            products.forEach(p => getCheckedImages(p).forEach(img => {
+                const r = getResult(img, size);
+                if (!r.processed_filename) failed.push({ product: p, img, unsupported: r.unsupported_ratio });
+            }));
+
+            const items = products.map(p => toSizeDownloadItem(p, size)).filter(it => it.images.length > 0);
+            if (failed.length > 0) {
+                const unsupported = failed.filter(f => f.unsupported).length;
+                const lines = failed.slice(0, 10).map(f => `- ${f.product.product_code || f.product.product_no} ${f.img.label}`);
+                if (failed.length > 10) lines.push(`... 외 ${failed.length - 10}장`);
+                alert(`변환에 실패한 이미지 ${failed.length}장은 ZIP에서 제외됩니다`
+                    + (unsupported > 0 ? ` (지원하지 않는 원본 비율 ${unsupported}장 포함)` : '') + `.\n${lines.join('\n')}`);
+            }
+            if (items.length === 0) return;
+
+            await downloadItems(items);
+        }
+
+        // 상품 헤더의 "받기": 이 상품에서 체크된 이미지를 현재 탭 사이즈로 변환해 ZIP으로 내려받는다.
+        // 카페24 송신은 하지 않는다.
+        async function downloadProduct(productNo) {
+            const product = findProduct(productNo);
+            if (!product) return;
+
+            if (getCheckedImages(product).length === 0) {
+                alert('이 상품에서 체크된 이미지가 없습니다. 받을 이미지를 체크해 주세요.');
+                return;
+            }
+
+            const size = workSize;
+            await waitRegenIdle();
+            await ensureConverted(product, size);
+            await downloadConvertedProducts([product], size);
+        }
+
+        // ② 상단 버튼: 선택된 이미지를 1500x1800으로 변환하고 ZIP으로 내려받는다.
+        async function runConvertAndDownload1500() {
+            const selected = getSelectedProducts();
+            if (selected.length === 0) {
+                alert('변환할 이미지를 1장 이상 선택해 주세요.');
+                return;
+            }
+
+            const btn = document.getElementById('convert1500Btn');
+            btn.disabled = true;
+            btn.classList.add('opacity-50', 'cursor-not-allowed');
+
+            try {
+                await waitRegenIdle();
+                let done = 0;
+                setProgress(done, selected.length, '1500x1800 변환 중...');
+                for (const product of selected) {
+                    await ensureConverted(product, '1500');
+                    done++;
+                    setProgress(done, selected.length, '1500x1800 변환 중...');
+                }
+                setProgress(done, selected.length, '1500x1800 변환 완료');
+                await downloadConvertedProducts(selected, '1500');
+            } finally {
+                btn.disabled = false;
+                btn.classList.remove('opacity-50', 'cursor-not-allowed');
+            }
+        }
+
+        // ==========================================
         // 2단계: 카페24로 송신 (POST /api/send-cafe24)
         // ==========================================
         async function runSendToCafe24() {
+            // 1500x1800은 다운로드 전용 - 어떤 경로로도 송신하지 않는다
+            if (workSize !== '1400') return;
             const selected = getSelectedProducts();
             if (selected.length === 0) {
                 alert('송신할 이미지를 1장 이상 선택해 주세요.');
@@ -938,6 +1321,7 @@
         }
 
         async function sendItemsToCafe24(targets) {
+            if (workSize !== '1400') return;   // 실패 재송신 등 다른 경로에서도 1500x1800 탭에서는 송신 금지
             const sendBtn = document.getElementById('sendBtn');
             sendBtn.disabled = true;
             sendBtn.classList.add('opacity-50', 'cursor-not-allowed');
@@ -1050,18 +1434,6 @@
                 btn.disabled = false;
                 btn.classList.remove('opacity-50', 'cursor-not-allowed');
             }
-        }
-
-        // 표의 행별 "받기" 버튼 - 해당 상품 1건만 다운로드
-        async function downloadProduct(productNo) {
-            const product = findProduct(productNo);
-            if (!product) return;
-
-            if (getSendableImages(product).length === 0) {
-                alert('체크된 이미지 중 변환된 것이 없습니다. 먼저 [1단계: 변환실행]을 진행해 주세요.');
-                return;
-            }
-            await downloadItems([toDownloadItem(product)]);
         }
 
         // 상단 "다운로드" 버튼 - 선택된 상품 전체를 ZIP으로 다운로드

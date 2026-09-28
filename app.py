@@ -15,6 +15,7 @@ from flask import Flask, request, jsonify, render_template, send_from_directory,
 from werkzeug.exceptions import HTTPException
 from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 from PIL import Image
+from thumbnail_1500 import process_image_bytes_1500, is_1500_output, UnsupportedRatioError
 
 load_dotenv()
 
@@ -1903,6 +1904,69 @@ def convert_thumbnails():
 
     return jsonify({"success": True, "data": results})
 
+
+# [1500x1800 변환 API] 다운로드 전용. 카페24로는 송신하지 않는다 (/api/send-cafe24가 차단).
+# 요청/응답 구조는 /api/convert와 같고, 결과 파일은 /api/download로 내려받는다.
+@app.route('/api/convert-1500', methods=['POST'])
+def convert_thumbnails_1500():
+    data = request.json or {}
+    mode = data.get('mode', 'product')
+    results = []
+
+    for item in data.get('products', []):
+        p_no = item.get('product_no')
+        images = item.get('images', []) or []
+        image_results = []
+
+        for img in images:
+            key = str(img.get('key') or 'main')
+            label = img.get('label') or key
+            url = img.get('url')
+            img_mode = img.get('mode') or mode
+
+            try:
+                resp = fetch_image(url, timeout=10)
+                source_name = os.path.basename((url or '').split('?')[0])
+                ext = os.path.splitext(source_name)[1].lower() or '.jpg'
+                safe_key = re.sub(r'[^0-9A-Za-z_-]', '_', key)
+                out_file = process_image_bytes_1500(
+                    resp.content, f"{p_no}_{safe_key}{ext}", img_mode, UPLOAD_FOLDER
+                )
+                image_results.append({
+                    "key": key,
+                    "label": label,
+                    "status": "SUCCESS",
+                    "mode": img_mode,
+                    "source_url": url,
+                    "processed_filename": out_file,
+                    "preview_url": f"/static/processed_images/{out_file}",
+                })
+            except UnsupportedRatioError as e:
+                logger.warning(f"[1500 변환 건너뜀] product_no={p_no} key={key}: {e}")
+                image_results.append({
+                    "key": key, "label": label, "status": "FAIL",
+                    "source_url": url, "error": str(e), "unsupported_ratio": True,
+                })
+            except Exception as e:
+                logger.exception(f"1500x1800 이미지 변환 실패 (product_no={p_no} key={key} url={url})")
+                image_results.append({
+                    "key": key, "label": label, "status": "FAIL",
+                    "source_url": url, "error": str(e),
+                })
+
+        success_count = sum(1 for r in image_results if r["status"] == "SUCCESS")
+        logger.info(f"[1500 변환] product_no={p_no} 요청 {len(images)}장 중 {success_count}장 성공")
+        results.append({
+            "product_no": p_no,
+            "status": "SUCCESS" if success_count else "FAIL",
+            "images": image_results,
+            "success_count": success_count,
+            "fail_count": len(image_results) - success_count,
+        })
+
+    return jsonify({"success": True, "data": results})
+
+
 # [다운로드 API] 변환된 이미지를 상품코드별 폴더로 묶어 ZIP으로 내려준다
 @app.route('/api/download', methods=['POST'])
 def download_processed_images():
@@ -2017,6 +2081,12 @@ def send_to_cafe24():
         main_filename = item.get('main_filename')
         add_filenames = item.get('add_filenames', []) or []
         has_additional_images = bool(item.get('has_additional_images'))
+
+        # 1500x1800 다운로드 전용 파일은 어떤 경로로도 카페24에 올리지 않는다.
+        if any(is_1500_output(name) for name in [main_filename, *add_filenames]):
+            logger.warning(f"[송신 차단] product_no={p_no} 1500x1800 파일은 송신할 수 없음")
+            fail_list.append({"product_no": p_no, "reason": "1500x1800 파일은 카페24로 송신할 수 없습니다."})
+            continue
 
         try:
             # [반영 방식 - /api/debug/product-link-test 진단으로 확정]

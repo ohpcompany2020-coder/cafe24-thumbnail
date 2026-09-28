@@ -142,28 +142,19 @@
             <div id="categoryAlertBody" class="bg-red-700/50 rounded-lg p-3 text-xs font-mono space-y-1"></div>
         </section>
 
-        <!-- 3. 상품 목록 표 (변환 전 vs 변환 후 이미지 리스트 표시) -->
+        <!-- 3. 상품 목록 (상품 1건당 대표/추가 이미지 카드를 가로로 나열, 변환 전 → 변환 후) -->
         <section class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-            <!-- 조회 결과 요약 (총 상품수) -->
+            <!-- 조회 결과 요약 (총 상품수 / 선택된 이미지 수) -->
             <div class="px-5 py-3 border-b border-slate-200 bg-slate-50/70 flex flex-wrap items-center gap-x-3 gap-y-1">
                 <span class="text-sm font-bold text-slate-800">총 상품수: <span id="totalCount">0</span>건</span>
+                <span class="text-sm font-bold text-indigo-700">선택된 이미지: <span id="selectedImageCount">0</span>장</span>
                 <span id="filterNote" class="text-xs text-slate-500"></span>
             </div>
-            <table class="w-full text-left text-sm text-slate-600">
-                <thead class="bg-slate-100 text-slate-700 font-semibold border-b border-slate-200">
-                    <tr>
-                        <th class="p-4 w-12 text-center">선택</th>
-                        <th class="p-4 w-14 text-center">No.</th>
-                        <th class="p-4 w-56">상품명 / 상품코드</th>
-                        <th class="p-4">이미지 (원본 → 변환 후) · 체크된 것만 변환/송신</th>
-                        <th class="p-4 w-32 text-center">진행 단계</th>
-                        <th class="p-4 w-24 text-center">다운로드</th>
-                    </tr>
-                </thead>
-                <tbody id="productTableBody" class="divide-y divide-slate-100">
-                    <!-- 행은 renderProductTable()에 의해 동적으로 생성됩니다 -->
-                </tbody>
-            </table>
+            <!-- 조회 중 로딩 표시 / 결과 없음 / 검색 안내 -->
+            <div id="listStatus" class="px-5 py-6 text-center text-sm text-slate-400"></div>
+            <div id="productList" class="divide-y divide-slate-100">
+                <!-- 상품 블록은 renderProductBlock()에 의해 동적으로 생성됩니다 -->
+            </div>
         </section>
 
         <!-- 4. 실패 상품 리스트 (실패 시에만 노출) -->
@@ -201,23 +192,24 @@
         // 상품 1건의 데이터 구조:
         // {
         //   product_no, product_code, product_name,
-        //   image_url,      // 원본(1:1) 이미지 URL - /api/convert 호출 시 서버가 다운로드하는 소스
+        //   model_name,     // 모델명 (헤더 표시용)
+        //   image_url,      // 대표 원본 이미지 URL (비율 무관) - /api/convert 호출 시 서버가 다운로드하는 소스
         //   filename,       // 원본 파일명(확장자 포함, GIF 포함)
         //   format,         // 'JPG' | 'PNG' | 'GIF' 등 표시용
         //   add_images,     // 추가이미지 원본 URL 목록 (buildImageList로 images에 합쳐짐)
         //   images,         // 대표+추가 이미지 목록. 각 항목:
         //                   //   { key: 'main'|'add_0'..., label: '대표'|'추가1'...,
-        //                   //     source_url, checked, preview_url, processed_filename, convert_error }
+        //                   //     source_url, checked, ratio, preview_url, processed_filename, convert_error }
         //                   //   checked=false인 이미지는 변환/송신/다운로드에서 모두 제외된다
+        //                   //   ratio: 이미지 로드 후 naturalWidth/Height로 판별한 '1:1' | '1:1.4' | '기타' | '확인불가'
+        //                   //   상품은 체크된 이미지가 1장 이상이면 "선택된 상품"이다 (별도 상태 없음)
         //   status          // 화면 "진행 단계" 컬럼에 표시할 텍스트
         // }
         let productsData = [];
 
-        // 전체 선택: 상품 행뿐 아니라 모든 이미지 체크박스까지 함께 맞춘다.
-        // (전체선택 후 바로 송신하면 "전부" 반영되는 것이 자연스러운 동작)
+        // 전체 선택: 모든 상품의 모든 이미지를 체크/해제한다.
         function toggleSelectAll() {
             const isChecked = document.getElementById('selectAll').checked;
-            document.querySelectorAll('.product-check').forEach(cb => cb.checked = isChecked);
             productsData.forEach(p => (p.images || []).forEach(img => { img.checked = isChecked; }));
             syncImageCheckboxUI();
         }
@@ -227,6 +219,14 @@
         function invertImageSelection() {
             if (productsData.length === 0) return;
             productsData.forEach(p => (p.images || []).forEach(img => { img.checked = !img.checked; }));
+            syncImageCheckboxUI();
+        }
+
+        // 상품 체크박스: 해당 상품의 모든 이미지를 한꺼번에 체크/해제한다.
+        function toggleProductChecked(productNo, checked) {
+            const product = findProduct(productNo);
+            if (!product) return;
+            (product.images || []).forEach(img => { img.checked = checked; });
             syncImageCheckboxUI();
         }
 
@@ -240,6 +240,37 @@
                 cb.checked = img.checked;
                 applyCardCheckedStyle(cb.dataset.productNo, cb.dataset.key, img.checked);
             });
+            productsData.forEach(syncProductCheckbox);
+            updateSelectionSummary();
+        }
+
+        // 상품 체크박스를 이미지 체크 상태에서 유도한다 (전부 체크 = 체크, 일부 = 중간 상태).
+        function syncProductCheckbox(product) {
+            const cb = document.querySelector(`.product-check[data-product-no="${product.product_no}"]`);
+            if (!cb) return;
+            const images = product.images || [];
+            const checkedCount = images.filter(i => i.checked).length;
+            cb.checked = images.length > 0 && checkedCount === images.length;
+            cb.indeterminate = checkedCount > 0 && checkedCount < images.length;
+        }
+
+        // 상단 "선택된 이미지" 수와 "전체 선택" 체크박스 상태를 갱신한다.
+        function updateSelectionSummary() {
+            let total = 0;
+            let checked = 0;
+            productsData.forEach(p => (p.images || []).forEach(img => {
+                total++;
+                if (img.checked) checked++;
+            }));
+
+            const countEl = document.getElementById('selectedImageCount');
+            if (countEl) countEl.innerText = checked;
+
+            const selectAll = document.getElementById('selectAll');
+            if (selectAll) {
+                selectAll.checked = total > 0 && checked === total;
+                selectAll.indeterminate = checked > 0 && checked < total;
+            }
         }
 
         // 체크된 모든 이미지의 가공모드를 일괄 변경 (상단 "가공 모드 일괄" 드롭다운)
@@ -290,18 +321,19 @@
             }
         }
 
-        // 한 요청에서 처리할 건수. 상품마다 원본 이미지를 열어 비율을 확인하므로
-        // 100건씩 처리하면 서버 응답이 Render 요청 타임아웃(약 30초)을 넘겨 502가 난다.
+        // 한 요청에서 처리할 건수. 상품마다 추가이미지 보완 조회가 필요할 수 있어
+        // 100건씩 처리하면 서버 응답이 Render 요청 타임아웃(약 30초)을 넘겨 502가 날 수 있다.
         // 작게 잘라 요청 수를 늘리는 대신 요청 하나의 시간을 짧게 유지한다.
         const SEARCH_PAGE_SIZE = 30;
         // 검색 조건이 지나치게 넓을 때 무한정 조회하지 않도록 하는 안전장치
         const SEARCH_HARD_CAP = 3000;
 
         // 마지막 검색의 집계 정보 (총 상품수 / 제외 건수 표시에 사용)
-        let searchMeta = { scanned: 0, cafe24Total: null, excludedStatus: 0, excludedRatio: 0, done: false };
+        // state: 'idle'(검색 전) | 'loading'(조회 중) | 'done'(조회 끝)
+        let searchMeta = { scanned: 0, cafe24Total: null, excludedStatus: 0, state: 'idle' };
 
         function resetSearchMeta() {
-            searchMeta = { scanned: 0, cafe24Total: null, excludedStatus: 0, excludedRatio: 0, done: false };
+            searchMeta = { scanned: 0, cafe24Total: null, excludedStatus: 0, state: 'idle' };
         }
 
         // GET /api/products/search 호출 - 카페24 Admin API 기반 상품 검색
@@ -324,6 +356,7 @@
 
             productsData = [];
             resetSearchMeta();
+            searchMeta.state = 'loading';
             renderProductTable();
             setProgress(0, 1, '상품 조회 중...');
 
@@ -372,18 +405,20 @@
                         searchMeta.cafe24Total = json.total_count;
                     }
 
-                    productsData.push(...(json.data || []).map(p => ({
+                    const newProducts = (json.data || []).map(p => ({
                         ...p,
                         images: buildImageList(p),
                         status: '조회 완료'
-                    })));
+                    }));
+                    const startIndex = productsData.length;
+                    productsData.push(...newProducts);
 
                     searchMeta.scanned += json.fetched_count || 0;
                     searchMeta.excludedStatus += json.excluded_status_count || 0;
-                    searchMeta.excludedRatio += json.excluded_ratio_count || 0;
 
-                    // 페이지마다 즉시 화면에 반영해서 진행 상황이 보이게 한다
-                    renderProductTable();
+                    // 페이지마다 새 상품만 뒤에 붙여 화면에 반영한다 (전체를 다시 그리면
+                    // 상품이 많을수록 느려지고 이미 불러온 이미지가 다시 만들어진다)
+                    appendProductBlocks(newProducts, startIndex);
                     const totalForBar = searchMeta.cafe24Total || searchMeta.scanned;
                     setProgress(
                         Math.min(searchMeta.scanned, totalForBar),
@@ -402,25 +437,28 @@
                     }
                 }
 
-                searchMeta.done = true;
-                renderProductTable();
                 setProgress(1, 1, `상품 조회 완료 (${productsData.length}건 표시)`);
             } catch (e) {
                 alert(`상품 조회 중 오류가 발생했습니다: ${e.message}`);
             } finally {
+                searchMeta.state = 'done';
+                renderSearchSummary();
+                renderListStatus();
                 searchBtn.disabled = false;
                 searchBtn.classList.remove('opacity-50', 'cursor-not-allowed');
             }
         }
 
         // 상품의 대표이미지 + 추가이미지를 하나의 목록으로 만든다.
-        // 각 이미지는 개별 체크박스를 가지며 기본값은 전부 체크된 상태다.
+        // 각 이미지는 개별 체크박스를 가지며 기본값은 선택 안 됨이다. (조회 직후 상품이
+        // 전부 선택돼 있으면 "전체 송신"이 한 번의 클릭으로 되어 버리기 때문)
         function buildImageList(product) {
             const images = [{
                 key: 'main',
                 label: '대표',
                 source_url: product.image_url,
-                checked: true,
+                checked: false,
+                ratio: null,
                 mode: 'product',   // 이미지별 가공모드 기본값
                 preview_url: null,
                 processed_filename: null,
@@ -432,7 +470,8 @@
                     key: `add_${idx}`,
                     label: `추가${idx + 1}`,
                     source_url: url,
-                    checked: true,
+                    checked: false,
+                    ratio: null,
                     mode: 'product',
                     preview_url: null,
                     processed_filename: null,
@@ -455,10 +494,15 @@
         // ==========================================
         // 공통 유틸
         // ==========================================
+        // 체크된 이미지가 1장 이상인 상품 = 선택된 상품
         function getSelectedProducts() {
-            const checkedNos = Array.from(document.querySelectorAll('.product-check:checked'))
-                .map(cb => cb.dataset.productNo);
-            return productsData.filter(p => checkedNos.includes(p.product_no));
+            return productsData.filter(p => getCheckedImages(p).length > 0);
+        }
+
+        function escapeHtml(value) {
+            return String(value ?? '').replace(/[&<>"']/g, c => (
+                { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+            ));
         }
 
         function findProduct(productNo) {
@@ -536,59 +580,117 @@
             if (searchMeta.excludedStatus > 0) {
                 parts.push(`진열/판매/품절 제외 ${searchMeta.excludedStatus}건`);
             }
-            if (searchMeta.excludedRatio > 0) {
-                parts.push(`원본 비1:1 제외 ${searchMeta.excludedRatio}건`);
-            }
-            if (searchMeta.excludedStatus === 0 && searchMeta.excludedRatio === 0) {
+            if (searchMeta.excludedStatus === 0) {
                 parts.push('제외 0건');
             }
             noteEl.innerText = `(${parts.join(' / ')})`;
         }
 
-        function renderProductTable() {
-            const tbody = document.getElementById('productTableBody');
-            renderSearchSummary();
+        // 목록 위 상태 문구: 조회 중 로딩 표시 / 결과 없음 / 검색 안내. 상품이 있으면 숨긴다.
+        function renderListStatus() {
+            const el = document.getElementById('listStatus');
+            if (!el) return;
 
-            if (productsData.length === 0) {
-                tbody.innerHTML = `
-                    <tr>
-                        <td colspan="6" class="p-6 text-center text-sm text-slate-400">
-                            상단 검색창에서 모델명을 입력 후 조회해 주세요
-                        </td>
-                    </tr>`;
-                return;
+            if (searchMeta.state === 'loading' && productsData.length === 0) {
+                el.classList.remove('hidden');
+                el.innerHTML = `
+                    <span class="inline-flex items-center gap-2 text-indigo-600 font-medium">
+                        <svg class="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
+                            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path>
+                        </svg>
+                        상품을 조회하는 중입니다...
+                    </span>`;
+            } else if (productsData.length > 0) {
+                el.classList.add('hidden');
+                el.innerHTML = '';
+            } else {
+                el.classList.remove('hidden');
+                el.innerText = searchMeta.state === 'done'
+                    ? '검색 결과가 없습니다'
+                    : '상단 검색창에서 모델명을 입력 후 조회해 주세요';
             }
-
-            tbody.innerHTML = productsData.map((p, idx) => `
-                <tr class="hover:bg-slate-50 align-top" id="row-${p.product_no}">
-                    <td class="p-4 text-center">
-                        <input type="checkbox" class="product-check w-4 h-4 rounded" data-product-no="${p.product_no}">
-                    </td>
-                    <td class="p-4 text-center font-mono text-xs text-slate-400">${idx + 1}</td>
-                    <td class="p-4">
-                        <div class="font-semibold text-slate-800">${p.product_name}</div>
-                        <div class="text-xs text-slate-400 mt-0.5">${p.product_code}</div>
-                        <div class="text-[11px] text-slate-400 mt-1">
-                            이미지 ${p.images.length}장 (추가 ${p.images.length - 1}장)
-                        </div>
-                    </td>
-                    <td class="p-3">
-                        <div class="flex flex-wrap gap-3">
-                            ${p.images.map(img => renderImageCard(p, img)).join('')}
-                        </div>
-                    </td>
-                    <td class="p-4 text-center" id="status-cell-${p.product_no}">${statusBadge(p.status)}</td>
-                    <td class="p-4 text-center">
-                        <button onclick="downloadProduct('${p.product_no}')"
-                            class="px-2.5 py-1.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 rounded text-xs font-semibold transition-colors">
-                            ⬇️ 받기
-                        </button>
-                    </td>
-                </tr>
-            `).join('');
         }
 
-        // 이미지 1장 카드: 체크박스 + 라벨 + 원본 썸네일 + 변환 결과 미리보기
+        // 목록 전체를 처음부터 다시 그린다 (검색 시작/초기화 시에만 사용).
+        // 조회 중 페이지가 도착할 때는 appendProductBlocks로 뒤에 붙인다.
+        function renderProductTable() {
+            document.getElementById('productList').innerHTML = '';
+            appendProductBlocks(productsData, 0);
+        }
+
+        function appendProductBlocks(products, startIndex) {
+            renderSearchSummary();
+            renderListStatus();
+
+            const list = document.getElementById('productList');
+            list.insertAdjacentHTML('beforeend', products.map((p, i) => renderProductBlock(p, startIndex + i)).join(''));
+            products.forEach(syncProductCheckbox);
+            updateSelectionSummary();
+        }
+
+        // 상품 1건 블록: 헤더(상품 체크박스/상품명/모델명·상품코드/이미지 수/진행 단계/다운로드)
+        // 아래에 대표, 추가1, 추가2... 이미지 카드를 가로로 나열한다 (많으면 가로 스크롤).
+        function renderProductBlock(p, idx) {
+            const addCount = p.images.length - 1;
+            const modelAndCode = [p.model_name, p.product_code].filter(Boolean).map(escapeHtml).join(' / ');
+
+            return `
+                <div class="px-5 py-3 hover:bg-slate-50/60" id="row-${p.product_no}">
+                    <div class="flex flex-wrap items-center gap-x-4 gap-y-1 mb-2">
+                        <input type="checkbox" class="product-check w-4 h-4 rounded" data-product-no="${p.product_no}"
+                            title="이 상품의 모든 이미지 선택/해제"
+                            onchange="toggleProductChecked('${p.product_no}', this.checked)">
+                        <span class="font-mono text-xs text-slate-400">${idx + 1}</span>
+                        <div class="min-w-0 flex-1">
+                            <span class="font-semibold text-slate-800">${escapeHtml(p.product_name)}</span>
+                            <span class="text-xs text-slate-400 ml-2">${modelAndCode}</span>
+                        </div>
+                        <span class="text-[11px] text-slate-500">이미지 ${p.images.length}장 (대표 1 + 추가 ${addCount})</span>
+                        <span id="status-cell-${p.product_no}">${statusBadge(p.status)}</span>
+                        <button onclick="downloadProduct('${p.product_no}')"
+                            class="px-2.5 py-1 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 rounded text-xs font-semibold transition-colors">
+                            ⬇️ 받기
+                        </button>
+                    </div>
+                    <div class="flex gap-3 overflow-x-auto pb-2">
+                        ${p.images.map(img => renderImageCard(p, img)).join('')}
+                    </div>
+                </div>`;
+        }
+
+        // 원본 이미지 비율 라벨: naturalWidth/naturalHeight 기준 (서버 쪽 판정과 같은 허용오차 0.02)
+        function classifyRatio(width, height) {
+            if (!width || !height) return '확인불가';
+            const r = height / width;
+            if (Math.abs(r - 1.0) <= 0.02) return '1:1';
+            if (Math.abs(r - 1.4) <= 0.02) return '1:1.4';
+            return '기타';
+        }
+
+        function ratioBadge(ratio) {
+            if (!ratio) return '';
+            const styles = {
+                '1:1': 'bg-sky-100 text-sky-700',
+                '1:1.4': 'bg-emerald-100 text-emerald-700',
+                '기타': 'bg-amber-100 text-amber-700',
+                '확인불가': 'bg-slate-100 text-slate-400'
+            };
+            return `<span class="px-1 py-0.5 rounded text-[9px] font-semibold ${styles[ratio] || styles['확인불가']}">${ratio}</span>`;
+        }
+
+        // 원본 <img>의 onload/onerror에서 호출 - 결과를 상태에 저장해 두므로 다시 그려도 유지된다.
+        function onSourceImageLoaded(imgEl, productNo, key, failed) {
+            const product = findProduct(productNo);
+            const img = product && product.images.find(i => i.key === key);
+            if (!img) return;
+
+            img.ratio = failed ? '확인불가' : classifyRatio(imgEl.naturalWidth, imgEl.naturalHeight);
+            const slot = document.getElementById(`ratio-${productNo}-${key}`);
+            if (slot) slot.innerHTML = ratioBadge(img.ratio);
+        }
+
+        // 이미지 1장 카드: 체크박스 + 역할(대표/추가N) + 비율 라벨 + 원본 썸네일 + 변환 결과 미리보기
         function renderImageCard(product, img) {
             const cellId = `preview-${product.product_no}-${img.key}`;
             const isMain = img.key === 'main';
@@ -597,7 +699,7 @@
                 : 'bg-slate-100 text-slate-600 border-slate-200';
 
             return `
-                <div class="border ${img.checked ? 'border-slate-200' : 'border-dashed border-slate-300 opacity-50'} rounded-lg p-2 bg-white"
+                <div class="shrink-0 border ${img.checked ? 'border-slate-200' : 'border-dashed border-slate-300 opacity-50'} rounded-lg p-2 bg-white"
                      id="card-${product.product_no}-${img.key}">
                     <label class="flex items-center gap-1.5 cursor-pointer mb-1.5">
                         <input type="checkbox" class="image-check w-3.5 h-3.5 rounded"
@@ -605,9 +707,12 @@
                             ${img.checked ? 'checked' : ''}
                             onchange="toggleImageChecked('${product.product_no}', '${img.key}', this.checked)">
                         <span class="px-1.5 py-0.5 border ${labelClass} rounded text-[10px] font-bold">${img.label}</span>
+                        <span id="ratio-${product.product_no}-${img.key}">${ratioBadge(img.ratio)}</span>
                     </label>
                     <div class="flex items-end gap-1">
-                        <img src="${img.source_url}" alt="${img.label} 원본"
+                        <img src="${escapeHtml(img.source_url)}" alt="${img.label} 원본" loading="lazy" decoding="async"
+                            onload="onSourceImageLoaded(this, '${product.product_no}', '${img.key}', false)"
+                            onerror="onSourceImageLoaded(this, '${product.product_no}', '${img.key}', true)"
                             class="w-14 h-14 object-cover rounded border border-slate-200 bg-slate-100">
                         <span class="text-slate-300 text-xs pb-5">→</span>
                         <div id="${cellId}">${renderPreviewBox(img)}</div>
@@ -650,6 +755,8 @@
             if (img) img.checked = checked;
 
             applyCardCheckedStyle(productNo, key, checked);
+            syncProductCheckbox(product);
+            updateSelectionSummary();
         }
 
         // ==========================================
@@ -671,7 +778,7 @@
         async function runConvert() {
             const selected = getSelectedProducts();
             if (selected.length === 0) {
-                alert('변환할 상품을 1건 이상 선택해 주세요.');
+                alert('변환할 이미지를 1장 이상 선택해 주세요.');
                 return;
             }
 
@@ -756,7 +863,7 @@
         async function runSendToCafe24() {
             const selected = getSelectedProducts();
             if (selected.length === 0) {
-                alert('송신할 상품을 1건 이상 선택해 주세요.');
+                alert('송신할 이미지를 1장 이상 선택해 주세요.');
                 return;
             }
 
@@ -961,7 +1068,7 @@
         async function downloadSelected() {
             const selected = getSelectedProducts();
             if (selected.length === 0) {
-                alert('다운로드할 상품을 1건 이상 선택해 주세요.');
+                alert('다운로드할 이미지를 1장 이상 선택해 주세요.');
                 return;
             }
 

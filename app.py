@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 from flask import Flask, request, jsonify, render_template, send_from_directory, send_file
 from werkzeug.exceptions import HTTPException
 from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
-from PIL import Image, ImageFile
+from PIL import Image
 
 load_dotenv()
 
@@ -347,104 +347,9 @@ def fetch_image(url, timeout=10):
     # 모든 후보 Referer에서 403이 발생한 경우 마지막 응답으로 에러를 표면화
     last_error.raise_for_status()
 
-# 이미지 1건당 비율 확인에 허용할 시간(초). 짧게 잡아 느린 이미지 하나가 페이지 전체를
-# 붙잡지 못하게 한다 - 확인 못 한 상품은 '판정 불가'로 두고 목록에는 그대로 남긴다.
-IMAGE_PROBE_TIMEOUT = float(os.getenv('IMAGE_PROBE_TIMEOUT', 4))
-# 한 페이지의 비율 확인 전체에 허용할 시간(초). 이 시간이 지나면 남은 건 포기하고 응답한다.
-# 카페24 API 호출 시간까지 더해도 Render 요청 타임아웃(약 30초) 안에 들어오도록 잡는다.
+# 한 페이지의 추가이미지 보완 조회 전체에 허용할 시간(초). 이 시간이 지나면 남은 건 포기하고
+# 응답한다. 카페24 API 호출 시간까지 더해도 Render 요청 타임아웃(약 30초) 안에 들어오도록 잡는다.
 IMAGE_PROBE_BUDGET = float(os.getenv('IMAGE_PROBE_BUDGET', 12))
-
-
-def get_remote_image_size(url, timeout=IMAGE_PROBE_TIMEOUT):
-    """이미지 전체를 내려받지 않고 헤더 부분만 스트리밍해서 (width, height)를 얻는다.
-
-    검색 결과의 모든 상품 이미지를 원본 그대로 받으면 느리므로, PIL의 증분 파서에
-    앞부분 청크만 흘려넣어 크기가 확정되는 즉시 연결을 끊는다.
-    실패하면 None을 반환한다 (호출부에서 '판정 불가'로 처리)."""
-    if not url:
-        return None
-
-    for referer in SHOP_REFERER_CANDIDATES:
-        try:
-            headers = {'User-Agent': IMAGE_DOWNLOAD_USER_AGENT, 'Referer': referer}
-            with requests.get(url, headers=headers, timeout=timeout, stream=True) as resp:
-                if resp.status_code == 403:
-                    continue
-                resp.raise_for_status()
-
-                parser = ImageFile.Parser()
-                for chunk in resp.iter_content(chunk_size=4096):
-                    if not chunk:
-                        continue
-                    parser.feed(chunk)
-                    if parser.image:
-                        return parser.image.size
-        except Exception as e:
-            logger.debug(f"[이미지 크기 조회 실패] url={url} referer={referer}: {e}")
-            continue
-
-    return None
-
-
-def is_square_image(url, tolerance=0.02, timeout=IMAGE_PROBE_TIMEOUT):
-    """이미지가 1:1 비율인지 판정한다. 크기를 확인하지 못하면 None(판정 불가)을 반환한다."""
-    size = get_remote_image_size(url, timeout=timeout)
-    if not size:
-        return None
-
-    width, height = size
-    if not width or not height:
-        return None
-    return abs((height / width) - 1.0) <= tolerance
-
-
-def probe_square_flags(products, budget_seconds=IMAGE_PROBE_BUDGET, max_workers=16):
-    """상품 목록의 1:1 여부를 병렬로 확인한다.
-
-    전체에 시간 상한(budget)을 둔다. 이미지 서버가 느리거나 응답하지 않을 때
-    페이지 처리가 무한정 늘어나 요청 자체가 타임아웃(502)되는 것을 막기 위함이다.
-    상한 안에 끝내지 못한 상품은 None(판정 불가)으로 두어 목록에 그대로 남긴다.
-
-    executor.shutdown(wait=False)로 남은 작업을 기다리지 않고 즉시 반환한다.
-    (with 블록을 쓰면 shutdown이 실행 중인 작업을 모두 기다려 상한이 무의미해진다)"""
-    flags = [None] * len(products)
-    if not products:
-        return flags
-
-    started = time.monotonic()
-    executor = ThreadPoolExecutor(max_workers=max_workers)
-    try:
-        future_to_index = {
-            executor.submit(is_square_image, product['image_url']): idx
-            for idx, product in enumerate(products)
-        }
-
-        done, not_done = futures_wait(future_to_index.keys(), timeout=budget_seconds)
-
-        for future in done:
-            idx = future_to_index[future]
-            try:
-                flags[idx] = future.result()
-            except Exception as e:
-                logger.warning(f"[비율 확인 예외] product_no={products[idx].get('product_no')}: {e}")
-                flags[idx] = None
-
-        for future in not_done:
-            future.cancel()
-            idx = future_to_index[future]
-            logger.warning(
-                f"[비율 확인 시간초과] product_no={products[idx].get('product_no')} "
-                f"url={products[idx].get('image_url')} - 판정 불가로 두고 목록에는 표시"
-            )
-    finally:
-        executor.shutdown(wait=False)
-
-    elapsed = time.monotonic() - started
-    timed_out = sum(1 for f in flags if f is None)
-    logger.info(
-        f"[비율 확인] {len(products)}건 처리 {elapsed:.1f}초 (판정 불가 {timed_out}건)"
-    )
-    return flags
 
 
 def verify_image_dimensions(product_no, field_name, image_url, expected_ratio=1.4, tolerance=0.02, retry_delay=3):
@@ -1553,8 +1458,8 @@ def cafe24_auth_callback():
 
 # 카페24 Admin API의 상품 목록 조회 limit 상한
 CAFE24_PRODUCTS_MAX_LIMIT = 100
-# 한 요청에서 처리할 기본 건수. 상품마다 이미지를 열어 비율을 확인해야 하므로 100건을
-# 한 번에 처리하면 Render의 요청 타임아웃(약 30초)에 걸려 502가 난다. 페이지를 잘게
+# 한 요청에서 처리할 기본 건수. 추가이미지 보완 조회가 상품 수만큼 발생할 수 있어 100건을
+# 한 번에 처리하면 Render의 요청 타임아웃(약 30초)에 걸릴 수 있다. 페이지를 잘게
 # 나눠 한 요청의 처리 시간을 짧게 유지한다.
 CAFE24_PRODUCTS_DEFAULT_LIMIT = int(os.getenv('SEARCH_PAGE_SIZE', 30))
 
@@ -1747,9 +1652,10 @@ def search_products():
 
     카페24 API는 한 번에 최대 100건까지만 주므로 전체(예: 303건)를 보려면 offset을
     옮겨가며 반복 호출해야 한다. 한 번에 전부 처리하지 않고 페이지 단위로 나눠
-    응답하는 이유는, 상품마다 원본 이미지를 열어 1:1 비율을 확인해야 해서 전체를
-    한 요청에 담으면 응답이 너무 오래 걸리고(게이트웨이 타임아웃 위험) 진행 상황도
-    보여줄 수 없기 때문이다. 프런트가 total_count를 보고 offset을 이어서 호출한다.
+    응답하는 이유는, 상품마다 추가이미지를 보완 조회해야 할 수 있어 전체를 한 요청에
+    담으면 응답이 너무 오래 걸리고(게이트웨이 타임아웃 위험) 진행 상황도 보여줄 수
+    없기 때문이다. 이미지 비율로는 거르지 않는다. 프런트가 total_count를 보고 offset을
+    이어서 호출한다.
     """
     # 파라미터 파싱까지 포함해 라우트 전체를 감싼다. 잘못된 쿼리스트링(int 변환 실패
     # 등)으로 예외가 나도 HTML 에러 페이지가 아니라 항상 JSON을 돌려주기 위함이다.
@@ -1766,8 +1672,6 @@ def search_products():
 
         sort = request.args.get('sort', '').strip()
         order = request.args.get('order', '').strip()
-        # 원본 대표이미지가 1:1인 상품만 표시 (변환 대상이 정방형 이미지이므로 기본 활성화)
-        only_square = request.args.get('only_square', 'true').lower() != 'false'
         # 진열함 + 판매함 + 품절아님 상품만 표시
         only_available = request.args.get('only_available', 'true').lower() != 'false'
 
@@ -1853,6 +1757,7 @@ def search_products():
                 "product_no": str(product_no),
                 "product_code": product_code,
                 "product_name": p.get('product_name', ''),
+                "model_name": p.get('model_name') or '',
                 "image_url": main_image,
                 "filename": filename,
                 "format": ext,
@@ -1865,46 +1770,19 @@ def search_products():
 
         excluded_status_count = len(excluded)
 
-        # [2차 필터] 원본 대표이미지를 실제로 열어 1:1인 상품만 남긴다. 상품 수만큼
-        # 요청이 필요하므로 병렬로 처리하고, 크기를 확인하지 못한 상품은 임의로 지우지
-        # 않고 그대로 남긴다 (조회 실패를 "비정방형"으로 오판하지 않기 위함).
-        if only_square and products:
-            square_flags = probe_square_flags(products)
-
-            kept = []
-            for product, is_square in zip(products, square_flags):
-                if is_square is False:
-                    excluded.append({
-                        "product_no": product['product_no'],
-                        "product_code": product['product_code'],
-                        "reason": "원본 대표이미지가 1:1 비율이 아님",
-                    })
-                    continue
-                if is_square is None:
-                    logger.warning(
-                        f"[비율 확인 실패] product_no={product['product_no']} "
-                        f"url={product['image_url']} - 목록에는 그대로 표시"
-                    )
-                    product['ratio_unknown'] = True
-                kept.append(product)
-
-            products = kept
-
         # 추가이미지 보완 조회: 목록 응답에 추가이미지 키가 아예 없었던 상품만 대상으로
-        # 전용 리소스를 호출한다. 필터를 모두 통과한 상품에 대해서만 하므로 호출 수가 적다.
+        # 전용 리소스를 호출한다. 상태 필터를 통과한 상품에 대해서만 하므로 호출 수가 적다.
         if products:
             attach_additional_images(products)
         for product in products:
             product.pop('add_images_loaded', None)
 
-        excluded_ratio_count = len(excluded) - excluded_status_count
         elapsed = time.monotonic() - page_started
         total_add_images = sum(len(p.get('add_images') or []) for p in products)
         logger.info(
             f"[페이지 처리 완료] offset={offset} 소요시간 {elapsed:.1f}초 - "
             f"조회 {fetched_count}건 중 {len(products)}건 표시 "
-            f"(상태 제외 {excluded_status_count}건 / 비1:1 제외 {excluded_ratio_count}건 / "
-            f"추가이미지 합계 {total_add_images}장)"
+            f"(상태 제외 {excluded_status_count}건 / 추가이미지 합계 {total_add_images}장)"
         )
 
         return jsonify({
@@ -1918,7 +1796,6 @@ def search_products():
             "has_more": fetched_count == limit,    # 다음 페이지가 더 있을 가능성
             "excluded_count": len(excluded),
             "excluded_status_count": excluded_status_count,
-            "excluded_ratio_count": excluded_ratio_count,
             "excluded": excluded,
             "requested_url": res.url
         })
